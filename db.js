@@ -7,6 +7,12 @@ const pool = new Pool({
     : { rejectUnauthorized: false },
 });
 
+// Same normalization matching.js uses for artist names, kept here too so the
+// migration below can run standalone without circular-requiring matching.js.
+function artistKey(artist) {
+  return String(artist).trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
 async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS config (
@@ -90,6 +96,57 @@ async function initSchema() {
       PRIMARY KEY (show_id, companion_id)
     );
   `);
+
+  await dedupeSongs();
 }
 
-module.exports = { pool, initSchema };
+// ---------------------------------------------------------------------
+// One-time-ish migration: the original UNIQUE(artist, normalized_key)
+// constraint matched on the *raw* artist string, so the same artist typed
+// with different casing/whitespace across two shows (e.g. "Jimmy Eat World"
+// vs "Jimmy eat world ") created two separate "songs" rows for the same
+// actual song — inflating the unique-song count. This adds a normalized
+// artist_key column, merges any rows that collide once artist casing/
+// whitespace is ignored, and repoints the constraint to that key so it
+// can't happen again. Safe to run every boot — it's a no-op once clean.
+// ---------------------------------------------------------------------
+async function dedupeSongs() {
+  await pool.query(`ALTER TABLE songs ADD COLUMN IF NOT EXISTS artist_key TEXT;`);
+  await pool.query(`
+    UPDATE songs SET artist_key = lower(regexp_replace(trim(artist), '\\s+', ' ', 'g'))
+    WHERE artist_key IS DISTINCT FROM lower(regexp_replace(trim(artist), '\\s+', ' ', 'g'))
+  `);
+
+  const dupGroups = (await pool.query(`
+    SELECT artist_key, normalized_key, array_agg(id ORDER BY id) AS ids
+    FROM songs
+    GROUP BY artist_key, normalized_key
+    HAVING count(*) > 1
+  `)).rows;
+
+  for (const g of dupGroups) {
+    const [keepId, ...dupIds] = g.ids;
+    await pool.query(`UPDATE show_songs SET song_id=$1 WHERE song_id = ANY($2::int[])`, [keepId, dupIds]);
+    await pool.query(`DELETE FROM songs WHERE id = ANY($1::int[])`, [dupIds]);
+  }
+
+  // Repoint the uniqueness guarantee to the normalized key so this class of
+  // duplicate can't reappear, regardless of what the original constraint
+  // happened to be named.
+  await pool.query(`
+    DO $$
+    DECLARE
+      c RECORD;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'songs'::regclass AND contype = 'u'
+      LOOP
+        EXECUTE format('ALTER TABLE songs DROP CONSTRAINT %I', c.conname);
+      END LOOP;
+    END $$;
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS songs_artist_key_normalized_key_idx ON songs(artist_key, normalized_key);`);
+}
+
+module.exports = { pool, initSchema, artistKey };
