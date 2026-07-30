@@ -3,6 +3,39 @@ let activeTab = 'sync';
 let wizardShowId = null;
 let wizardStage = null; // 'tag' | 'spotify' | 'playlist'
 
+let dashboardSubtab = 'overview'; // overview | trends | travel | superlatives | journey | unknowns
+let selectedCompanionIds = new Set(); // empty == "All"
+let allCompanions = [];
+
+const DASHBOARD_SUBTABS = [
+  ['overview', 'Overview'],
+  ['trends', 'Trends'],
+  ['travel', 'Travel'],
+  ['superlatives', 'Superlatives'],
+  ['journey', 'Journey'],
+  ['unknowns', 'Unknowns'],
+  ['spotifygaps', 'Spotify Gaps'],
+];
+
+function companionsQuery() {
+  return selectedCompanionIds.size ? `?companions=${[...selectedCompanionIds].join(',')}` : '';
+}
+
+function showModal(message, { title = '', okLabel = 'Okay' } = {}) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-box">
+      ${title ? `<h2>${title}</h2>` : ''}
+      <p>${message}</p>
+      <button class="btn" id="modal-ok-btn">${okLabel}</button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.querySelector('#modal-ok-btn').onclick = () => modal.remove();
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+
 const app = document.getElementById('app');
 const nav = document.getElementById('nav');
 
@@ -22,6 +55,71 @@ nav.addEventListener('click', e => {
   wizardShowId = null;
   renderTab();
 });
+
+async function loadCompanionsForFilter() {
+  allCompanions = await api('/api/companions');
+}
+
+function renderAttendeeFilterBar() {
+  const allActive = selectedCompanionIds.size === 0;
+  return `
+    <div class="card filter-bar">
+      <div class="row" style="align-items:center;">
+        <span class="muted" style="text-transform:uppercase;font-size:11px;">Attendee:</span>
+        <span class="pill ${allActive ? 'on' : ''}" data-attendee="all">All</span>
+        ${allCompanions.map(c => `<span class="pill ${selectedCompanionIds.has(c.id) ? 'on' : ''}" data-attendee="${c.id}">${c.name}</span>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function wireAttendeeFilterBar(onChange) {
+  app.querySelectorAll('[data-attendee]').forEach(p => {
+    p.onclick = () => {
+      if (p.dataset.attendee === 'all') {
+        selectedCompanionIds.clear();
+      } else {
+        const id = Number(p.dataset.attendee);
+        if (selectedCompanionIds.has(id)) selectedCompanionIds.delete(id);
+        else selectedCompanionIds.add(id);
+      }
+      onChange();
+    };
+  });
+}
+
+function renderDashboardSubnav() {
+  return `
+    <div class="row subnav">
+      ${DASHBOARD_SUBTABS.map(([key, label]) => `<button class="btn secondary sub-tab-btn ${dashboardSubtab === key ? 'active' : ''}" data-subtab="${key}">${label}</button>`).join('')}
+    </div>
+  `;
+}
+
+function wireDashboardSubnav() {
+  app.querySelectorAll('[data-subtab]').forEach(btn => {
+    btn.onclick = () => { dashboardSubtab = btn.dataset.subtab; renderDashboard(); };
+  });
+}
+
+async function renderDashboard() {
+  if (!allCompanions.length) await loadCompanionsForFilter();
+  const renderers = {
+    overview: renderOverview,
+    trends: renderTrends,
+    travel: renderTravel,
+    superlatives: renderSuperlatives,
+    journey: renderJourney,
+    unknowns: renderUnknowns,
+    spotifygaps: renderSpotifyGaps,
+  };
+  app.innerHTML = `<div id="dash-subnav-slot"></div><div id="dash-filter-slot"></div><div id="dash-body-slot"></div>`;
+  document.getElementById('dash-subnav-slot').innerHTML = renderDashboardSubnav();
+  document.getElementById('dash-filter-slot').innerHTML = renderAttendeeFilterBar();
+  wireDashboardSubnav();
+  wireAttendeeFilterBar(renderDashboard);
+  await renderers[dashboardSubtab]();
+}
 
 function setNavActive() {
   [...nav.querySelectorAll('button')].forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
@@ -59,14 +157,11 @@ function renderTab() {
   setNavActive();
   if (wizardShowId) return renderWizard();
   if (activeTab === 'sync') return renderSync();
-  if (activeTab === 'overview') return renderOverview();
-  if (activeTab === 'yearly') return renderYearly();
-  if (activeTab === 'trends') return renderTrends();
-  if (activeTab === 'travel') return renderTravel();
-  if (activeTab === 'superlatives') return renderSuperlatives();
-  if (activeTab === 'songstatus') return renderSongStatus();
+  if (activeTab === 'dashboard') return renderDashboard();
   if (activeTab === 'settings') return renderSettings();
 }
+
+function dashBody() { return document.getElementById('dash-body-slot'); }
 
 // ---------------- Settings ----------------
 async function renderSettings() {
@@ -97,6 +192,11 @@ async function renderSettings() {
     </div>
     <button class="btn" id="save-settings-btn">Save settings</button>
     <div class="success" id="settings-ok"></div>
+    <div class="card">
+      <h2>Session</h2>
+      <button class="btn danger" id="lock-btn">Lock app</button>
+      <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
+    </div>
   `;
   document.getElementById('import-btn').onclick = async () => {
     const statusEl = document.getElementById('import-status');
@@ -120,11 +220,19 @@ async function renderSettings() {
     }});
     document.getElementById('settings-ok').textContent = 'Saved.';
   };
+  document.getElementById('lock-btn').onclick = () => {
+    hostPw = null;
+    sessionStorage.removeItem('ct_pw');
+    renderLoginGate();
+  };
 }
 
 // ---------------- Sync ----------------
 async function renderSync() {
-  const pending = await api('/api/shows/pending');
+  const [pending, needsPlaylistUpdate] = await Promise.all([
+    api('/api/shows/pending'),
+    api('/api/shows/needs-playlist-update'),
+  ]);
   app.innerHTML = `
     <div class="card">
       <h2>Sync</h2>
@@ -140,19 +248,96 @@ async function renderSync() {
         </div>
       `).join('') : '<p class="muted">Nothing pending.</p>'}
     </div>
+    <div class="card">
+      <h2>Playlist updates needed (${needsPlaylistUpdate.length})</h2>
+      <p class="muted" style="margin-bottom:10px;">Songs that are now matched on Spotify but haven't made it into their playlist(s) yet — usually because a match was found after the show was already marked complete.</p>
+      ${needsPlaylistUpdate.length ? needsPlaylistUpdate.map(s => `
+        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
+          <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue}</div>
+          <button class="btn secondary" data-show="${s.id}" data-stage="playlist">Add to playlists</button>
+        </div>
+      `).join('') : '<p class="muted">Nothing pending.</p>'}
+    </div>
+    <div class="card">
+      <h2>Recheck Spotify for excluded songs</h2>
+      <p class="muted" style="margin-bottom:10px;">If a band releases an official version of a song after you saw it live, run this to see if it's findable now.</p>
+      <button class="btn secondary" id="recheck-btn">Recheck excluded songs</button>
+      <div id="recheck-results" style="margin-top:12px;"></div>
+    </div>
+    <div class="card">
+      <h2>All shows (edit)</h2>
+      <p class="muted" style="margin-bottom:10px;">Fix a mistake on any show, complete or not — reopens tagging, then Spotify review, then playlists, same as normal.</p>
+      <input id="all-shows-filter" placeholder="Filter by date or venue..." style="margin-bottom:10px;" />
+      <div id="all-shows-list"></div>
+    </div>
   `;
   document.getElementById('sync-btn').onclick = async () => {
     const statusEl = document.getElementById('sync-status');
     statusEl.textContent = 'Syncing...';
     try {
       const r = await api('/api/sync', { method: 'POST' });
-      statusEl.textContent = `Found ${r.newShows} new show(s).`;
+      if (r.newShows === 0) {
+        statusEl.textContent = '';
+        showModal('No new shows detected.');
+      } else {
+        statusEl.textContent = `Found ${r.newShows} new show(s).`;
+      }
       renderSync();
     } catch (e) { statusEl.textContent = e.message; }
   };
   app.querySelectorAll('[data-show]').forEach(btn => {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
+  document.getElementById('recheck-btn').onclick = () => runSpotifyRecheck();
+  wireAllShowsBrowser();
+}
+
+async function runSpotifyRecheck() {
+  const resultsEl = document.getElementById('recheck-results');
+  resultsEl.innerHTML = '<p class="muted">Searching Spotify for previously-excluded songs...</p>';
+  try {
+    const results = await api('/api/spotify/recheck-excluded');
+    if (!results.length) { resultsEl.innerHTML = '<p class="muted">No new matches found.</p>'; return; }
+    resultsEl.innerHTML = results.map(r => `
+      <div id="recheck-${r.songId}" style="margin-bottom:10px;">
+        <div class="muted" style="margin-bottom:4px;">${r.title} — ${r.artist}</div>
+        <div class="row">
+          ${r.candidates.map(c => `<button class="btn secondary" data-recheck-pick='${JSON.stringify({ songId: r.songId, track: c })}'>${c.albumName}</button>`).join('')}
+          <button class="btn danger" data-recheck-skip="${r.songId}">Still not it</button>
+        </div>
+      </div>
+    `).join('');
+    resultsEl.querySelectorAll('[data-recheck-pick]').forEach(btn => btn.onclick = async () => {
+      const { songId, track } = JSON.parse(btn.dataset.recheckPick);
+      await api('/api/spotify/recheck-excluded/apply', { method: 'POST', body: { songId, track } });
+      document.getElementById(`recheck-${songId}`).innerHTML = '<p class="success">Matched — check "Playlist updates needed" above.</p>';
+      renderSync();
+    });
+    resultsEl.querySelectorAll('[data-recheck-skip]').forEach(btn => btn.onclick = () => {
+      document.getElementById(`recheck-${btn.dataset.recheckSkip}`).remove();
+    });
+  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
+}
+
+async function wireAllShowsBrowser() {
+  const listEl = document.getElementById('all-shows-list');
+  const filterEl = document.getElementById('all-shows-filter');
+  const shows = await api('/api/shows/all');
+  function draw(filterText) {
+    const q = (filterText || '').toLowerCase();
+    const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
+    listEl.innerHTML = rows.slice(0, 100).map(s => `
+      <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
+        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue} <span class="muted">(${s.stage})</span></div>
+        <button class="btn secondary" data-edit-show="${s.id}">Edit</button>
+      </div>
+    `).join('') || '<p class="muted">No matches.</p>';
+    listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
+      wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
+    });
+  }
+  draw('');
+  filterEl.oninput = () => draw(filterEl.value);
 }
 
 // ---------------- Wizard: tag -> spotify review -> playlist submit ----------------
@@ -179,10 +364,11 @@ async function renderTagStage(show) {
           <div style="font-weight:500;margin-bottom:6px;">${a.artist}</div>
           <div class="row" style="margin-bottom:8px;"><button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Fill gap from another show</button></div>
           <table>
-            <tr><th>#</th><th>Song</th><th>Known</th><th>Status</th><th>Regret-eligible</th></tr>
+            <tr><th>#</th><th>Song</th><th>Cover</th><th>Known</th><th>Status</th><th>Regret-eligible</th><th></th></tr>
             ${a.songs.map(s => `
               <tr data-song-row="${s.id}">
                 <td>${s.play_order}</td><td>${s.title}</td>
+                <td>${s.is_cover ? '<span class="pill">cover</span>' : ''}</td>
                 <td><span class="pill known-pill ${s.known ? 'on' : ''}" data-toggle="known">${s.known ? 'Yes' : 'No'}</span></td>
                 <td>
                   <select class="status-select">
@@ -192,6 +378,7 @@ async function renderTagStage(show) {
                   </select>
                 </td>
                 <td><span class="pill liked-pill ${s.liked_now ? 'on' : ''}" data-toggle="liked">${s.liked_now ? 'Yes' : 'No'}</span></td>
+                <td><button class="btn danger" data-remove-song="${s.id}" style="padding:4px 8px;font-size:11px;">Remove</button></td>
               </tr>
             `).join('')}
           </table>
@@ -217,6 +404,13 @@ async function renderTagStage(show) {
   app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('.pill[data-companion]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('[data-fillgap]').forEach(btn => btn.onclick = () => openFillGap(btn.dataset.fillgap, btn.dataset.artist));
+  app.querySelectorAll('[data-remove-song]').forEach(btn => btn.onclick = async () => {
+    if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
+    try {
+      await api(`/api/show-songs/${btn.dataset.removeSong}/remove`, { method: 'POST' });
+      btn.closest('tr').remove();
+    } catch (e) { alert(e.message); }
+  });
 
   const newCompanionInput = document.getElementById('new-companion');
   const pendingNewCompanions = [];
@@ -295,12 +489,23 @@ async function renderSpotifyStage(show) {
     if (excludeBtn) excludeBtn.onclick = () => { rowEl.dataset.decision = JSON.stringify({ action: 'exclude' }); };
     const searchBtn = rowEl.querySelector('[data-manual-search]');
     if (searchBtn) searchBtn.onclick = () => openManualSpotifySearch(r, rowEl);
+    const removeBtn = rowEl.querySelector('[data-remove-from-dataset]');
+    if (removeBtn) removeBtn.onclick = async () => {
+      if (!confirm(`Remove "${r.title}" from this show's dataset? This can't be undone.`)) return;
+      try {
+        for (const id of (r.showSongIds || [])) {
+          await api(`/api/show-songs/${id}/remove`, { method: 'POST' });
+        }
+        rowEl.remove();
+      } catch (e) { alert(e.message); }
+    };
   });
 
   document.getElementById('continue-playlist-btn').onclick = async () => {
     const decisions = [];
     review.forEach(r => {
       const rowEl = document.getElementById(`match-${r.songId}`);
+      if (!rowEl) return; // removed from the dataset above — nothing to decide on
       const raw = rowEl.dataset.decision;
       if (raw) decisions.push({ songId: r.songId, ...JSON.parse(raw) });
       else if (r.status === 'pending' && r.suggested) decisions.push({ songId: r.songId, action: 'approve', track: r.suggested });
@@ -331,8 +536,9 @@ function renderMatchRow(r) {
           ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-select-track='${JSON.stringify(c)}'>${c.albumName}</button>`).join('')}
           <button class="btn danger" data-exclude>Exclude</button>
           <button class="btn secondary" data-manual-search>Search Spotify</button>
+          <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
         </div>
-      ` : `<div class="muted" style="margin-left:50px;">${r.status === 'excluded' ? 'Excluded' : 'Already resolved'} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button></div>`}
+      ` : `<div class="muted" style="margin-left:50px;">${r.status === 'excluded' ? 'Excluded' : 'Already resolved'} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
       <div id="manual-search-${r.songId}"></div>
     </div>
   `;
@@ -414,92 +620,283 @@ async function renderPlaylistStage(show) {
   };
 }
 
-// ---------------- Reports ----------------
+// ---------------- Reports (Dashboard subtabs) ----------------
+
+let chartTooltipEl = null;
+function ensureTooltipEl() {
+  if (!chartTooltipEl) {
+    chartTooltipEl = document.createElement('div');
+    chartTooltipEl.className = 'chart-tooltip';
+    document.body.appendChild(chartTooltipEl);
+  }
+  return chartTooltipEl;
+}
+
+function barChartHtml(id, rows, labelFn) {
+  const counts = rows.map(r => Number(r.shows));
+  const max = Math.max(...counts, 1);
+  return `
+    <div class="bar-chart" id="${id}">
+      ${rows.map(r => `
+        <div class="bar-col" data-shows="${r.shows}" data-artists="${r.artists}" data-songs="${r.songs}" data-venues="${r.venues}" data-label="${labelFn(r.bucket)}">
+          <div class="bar-datalabel">${r.shows}</div>
+          <div class="bar" style="height:${Math.max(4, (Number(r.shows) / max) * 140)}px;"></div>
+          <div class="bar-axislabel">${labelFn(r.bucket)}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function wireBarChart(id) {
+  const tip = ensureTooltipEl();
+  document.querySelectorAll(`#${id} .bar-col`).forEach(col => {
+    col.addEventListener('mouseenter', () => {
+      tip.innerHTML = `<b>${col.dataset.label}</b><br>${col.dataset.shows} shows<br>${col.dataset.artists} unique artists<br>${col.dataset.songs} unique songs<br>${col.dataset.venues} unique venues`;
+      tip.style.display = 'block';
+    });
+    col.addEventListener('mousemove', e => {
+      tip.style.left = (e.pageX + 14) + 'px';
+      tip.style.top = (e.pageY - 10) + 'px';
+    });
+    col.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  });
+}
+
 async function renderOverview() {
-  const data = await api('/api/report/overview');
+  const data = await api(`/api/report/overview${companionsQuery()}`);
   const t = data.totals;
-  app.innerHTML = `
+  dashBody().innerHTML = `
     <div class="card">
       <h2>Overview</h2>
       <div class="stat-grid" style="margin-bottom:20px;">
         <div class="stat-tile"><div class="num">${t.shows}</div><div class="label">Shows</div></div>
-        <div class="stat-tile"><div class="num">${t.artists}</div><div class="label">Artists</div></div>
-        <div class="stat-tile"><div class="num">${t.songs}</div><div class="label">Unique songs</div></div>
+        <div class="stat-tile"><div class="num">${t.unique_artists}</div><div class="label">Unique Artists</div></div>
+        <div class="stat-tile"><div class="num">${t.unique_songs}</div><div class="label">Unique songs</div></div>
         <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
       </div>
+      <div class="row" style="margin-bottom:12px;">
+        <button class="btn secondary" id="expand-all-btn">⇊ Expand all</button>
+        <button class="btn secondary" id="collapse-all-btn">⇈ Collapse all</button>
+      </div>
       <table>
-        <tr><th>Date</th><th>Artist</th><th>Billing</th><th>Songs</th><th>Known</th><th>Opener</th><th>Closer</th></tr>
-        ${data.showLog.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.billing_order || '—'}</td><td>${r.song_count}</td><td>${r.pct_known || 0}%</td><td>${r.opener}</td><td>${r.closer}</td></tr>`).join('')}
+        <tr><th></th><th>Date</th><th>Headliner</th><th>Location</th><th>Traveled from</th></tr>
+        ${data.shows.map(renderShowRow).join('')}
       </table>
     </div>
   `;
+  wireExpanders();
+  document.getElementById('expand-all-btn').onclick = () => {
+    dashBody().querySelectorAll('.nested-block').forEach(b => b.classList.remove('hidden'));
+    dashBody().querySelectorAll('[data-expand]').forEach(icon => icon.textContent = '−');
+    updateExpandCollapseButtons();
+  };
+  document.getElementById('collapse-all-btn').onclick = () => {
+    dashBody().querySelectorAll('.nested-block').forEach(b => b.classList.add('hidden'));
+    dashBody().querySelectorAll('[data-expand]').forEach(icon => icon.textContent = '+');
+    updateExpandCollapseButtons();
+  };
+  updateExpandCollapseButtons();
 }
 
-async function renderYearly() {
-  const rows = await api('/api/report/yearly');
-  const max = Math.max(...rows.map(r => r.shows), 1);
-  app.innerHTML = `
-    <div class="card">
-      <h2>Shows by year</h2>
-      <div class="row" style="align-items:flex-end;height:120px;">
-        ${rows.map(r => `<div style="flex:1;text-align:center;"><div style="background:var(--violet);height:${(r.shows / max) * 100}px;border-radius:4px 4px 0 0;"></div><div class="muted" style="margin-top:4px;">${r.year}</div></div>`).join('')}
-      </div>
-    </div>
+function updateExpandCollapseButtons() {
+  const blocks = [...dashBody().querySelectorAll('.nested-block')];
+  const expandBtn = document.getElementById('expand-all-btn');
+  const collapseBtn = document.getElementById('collapse-all-btn');
+  if (expandBtn) expandBtn.disabled = !blocks.some(b => b.classList.contains('hidden'));
+  if (collapseBtn) collapseBtn.disabled = !blocks.some(b => !b.classList.contains('hidden'));
+}
+
+function renderShowRow(sh) {
+  return `
+    <tr class="show-row">
+      <td><span class="expand-icon" data-expand="show-${sh.id}">+</span></td>
+      <td>${new Date(sh.date).toLocaleDateString()}</td>
+      <td>${sh.headliner}</td>
+      <td>${sh.location}</td>
+      <td>${sh.traveledFrom || '—'}</td>
+    </tr>
+    <tr class="nested-block hidden" id="block-show-${sh.id}"><td colspan="5">
+      <table>
+        <tr><th></th><th>Artist</th><th>Order</th><th>Songs</th><th>Known</th><th>Opener</th><th>Closer</th></tr>
+        ${sh.artists.map(renderArtistRow).join('')}
+      </table>
+    </td></tr>
   `;
+}
+
+function renderArtistRow(a) {
+  return `
+    <tr class="artist-row">
+      <td><span class="expand-icon" data-expand="artist-${a.showArtistId}">+</span></td>
+      <td>${a.artist}</td>
+      <td>${a.orderLabel}</td>
+      <td>${a.songCount}</td>
+      <td>${a.pctKnown}%</td>
+      <td>${a.opener || '—'}</td>
+      <td>${a.closer || '—'}</td>
+    </tr>
+    <tr class="nested-block hidden" id="block-artist-${a.showArtistId}"><td colspan="7">
+      <table>
+        <tr><th>Song</th><th>Known</th><th>Missed</th><th>Regret</th></tr>
+        ${a.songs.map(s => `<tr><td>${s.title}</td><td>${s.known ? 'Yes' : 'No'}</td><td>${s.missed ? 'Yes' : 'No'}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('')}
+      </table>
+    </td></tr>
+  `;
+}
+
+function wireExpanders() {
+  app.querySelectorAll('[data-expand]').forEach(icon => {
+    icon.onclick = () => {
+      const block = document.getElementById(`block-${icon.dataset.expand}`);
+      if (!block) return;
+      const wasHidden = block.classList.contains('hidden');
+      block.classList.toggle('hidden');
+      icon.textContent = wasHidden ? '−' : '+';
+      updateExpandCollapseButtons();
+    };
+  });
 }
 
 async function renderTrends() {
-  const data = await api('/api/report/trends');
+  const data = await api(`/api/report/trends${companionsQuery()}`);
+  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const wk = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  app.innerHTML = `
-    <div class="card"><h2>By season</h2><div class="row">${data.bySeason.map(s => `<span class="pill">${s.season}: ${s.shows}</span>`).join('')}</div></div>
-    <div class="card"><h2>By month</h2><div class="row">${data.byMonth.map(m => `<span class="pill">M${m.month}: ${m.shows}</span>`).join('')}</div></div>
-    <div class="card"><h2>By weekday</h2><div class="row">${data.byWeekday.map(w => `<span class="pill">${wk[w.weekday]}: ${w.shows}</span>`).join('')}</div></div>
+  dashBody().innerHTML = `
+    <div class="card"><h2>Shows by year</h2>${barChartHtml('chart-year', data.byYear, b => b)}</div>
+    <div class="card"><h2>Shows by month</h2>${barChartHtml('chart-month', data.byMonth, b => monthNames[b - 1])}</div>
+    <div class="card"><h2>Shows by season</h2>${barChartHtml('chart-season', data.bySeason, b => b)}</div>
+    <div class="card"><h2>Shows by weekday</h2>${barChartHtml('chart-weekday', data.byWeekday, b => wk[b])}</div>
   `;
+  ['chart-year', 'chart-month', 'chart-season', 'chart-weekday'].forEach(wireBarChart);
 }
 
 async function renderTravel() {
-  const data = await api('/api/report/travel');
-  app.innerHTML = `
+  const data = await api(`/api/report/travel${companionsQuery()}`);
+  const hours = Math.round((data.totals.hours || 0) * 10) / 10;
+  dashBody().innerHTML = `
     <div class="card">
       <h2>Travel</h2>
       <div class="stat-grid" style="margin-bottom:16px;">
         <div class="stat-tile"><div class="num">${Math.round(data.totals.miles || 0)}</div><div class="label">Total miles</div></div>
-        <div class="stat-tile"><div class="num">${Math.round((data.totals.hours || 0) * 10) / 10}</div><div class="label">Total hours</div></div>
+        <div class="stat-tile"><div class="num">${hours}</div><div class="label">Total travel time (hrs)</div></div>
       </div>
+      <button class="btn secondary" id="backfill-btn">Backfill missing travel data</button>
+      <div class="muted" id="backfill-status" style="margin-top:8px;"></div>
+    </div>
+    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
+      <div class="card" style="flex:1;min-width:280px;">
+        <h2>Local shows (Georgia)</h2>
+        <table>
+          <tr><th>Venue</th><th>Shows seen</th></tr>
+          ${data.local.map(v => `<tr><td>${v.venue}</td><td>${v.show_count}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
+        </table>
+      </div>
+      <div class="card" style="flex:1;min-width:280px;">
+        <h2>Travel shows</h2>
+        <table>
+          <tr><th>Venue</th><th>City</th><th>State</th><th>Miles</th><th>Travel time</th><th>Bands</th></tr>
+          ${data.travel.map(s => `<tr><td>${s.venue}</td><td>${s.city || '—'}</td><td>${s.state || '—'}</td><td>${s.distance_miles ?? '—'}</td><td>${s.duration_minutes != null ? (Math.round((s.duration_minutes / 60) * 10) / 10) + ' hrs' : '—'}</td><td>${s.bands || '—'}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
+        </table>
+      </div>
+    </div>
+  `;
+  document.getElementById('backfill-btn').onclick = async () => {
+    const statusEl = document.getElementById('backfill-status');
+    statusEl.textContent = 'Retrying geocoding for shows missing travel data...';
+    try {
+      const r = await api('/api/admin/backfill-travel', { method: 'POST' });
+      statusEl.textContent = `Fixed ${r.fixed} of ${r.checked} shows (${r.stillMissing} still missing).`;
+      renderTravel();
+    } catch (e) { statusEl.textContent = e.message; }
+  };
+}
+
+async function renderSuperlatives() {
+  const data = await api(`/api/report/superlatives${companionsQuery()}`);
+  dashBody().innerHTML = `
+    <div class="card">
+      <h2>Bands seen the most</h2>
       <table>
-        <tr><th>Date</th><th>Venue</th><th>City, state</th><th>Miles</th><th>Minutes</th></tr>
-        ${data.shows.map(s => `<tr><td>${new Date(s.date).toLocaleDateString()}</td><td>${s.venue}</td><td>${s.city}, ${s.state}</td><td>${s.distance_miles ?? '—'}</td><td>${s.duration_minutes ?? '—'}</td></tr>`).join('')}
+        <tr><th>Artist</th><th>Times seen</th><th>Song count</th><th>Headline %</th><th>Setlist variation %</th><th>Opener/closer variation %</th></tr>
+        ${data.bandsSeenMost.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.songCount}</td><td>${r.pctHeadline}%</td><td>${r.setlistVariationPct}%</td><td>${r.openCloseVariationPct}%</td></tr>`).join('')}
       </table>
+    </div>
+    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
+      <div class="card" style="flex:1;min-width:280px;">
+        <h2>Most unique songs by a repeat artist</h2>
+        <table>
+          <tr><th>Artist</th><th>Times seen</th><th>Unique songs</th></tr>
+          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.uniqueSongs}</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
+        </table>
+      </div>
+      <div class="card" style="flex:1;min-width:280px;">
+        <h2>Most opener/closer variation</h2>
+        <table>
+          <tr><th>Artist</th><th>Times seen</th><th>Variation %</th></tr>
+          ${data.mostOpenCloseVariation.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.openCloseVariationPct}%</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
+        </table>
+      </div>
     </div>
   `;
 }
 
-async function renderSuperlatives() {
-  const data = await api('/api/report/superlatives');
-  app.innerHTML = `
-    <div class="card"><h2>Most songs at a show</h2><table>${data.mostSongsAtShow.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.song_count}</td></tr>`).join('')}</table></div>
-    <div class="card"><h2>Most regret songs by artist</h2><table>${data.mostRegretByArtist.map(r => `<tr><td>${r.artist}</td><td>${r.regret_count}</td></tr>`).join('')}</table></div>
-    <div class="card"><h2>Most missed in a set</h2><table>${data.mostMissedInSet.map(r => `<tr><td>${r.artist}</td><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.missed_count}</td></tr>`).join('')}</table></div>
+async function renderJourney() {
+  const data = await api(`/api/report/journey${companionsQuery()}`);
+  dashBody().innerHTML = `
+    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
+      <div class="card" style="flex:1;min-width:300px;">
+        <h2>First 3 shows</h2>
+        ${data.first.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
+      </div>
+      <div class="card" style="flex:1;min-width:300px;">
+        <h2>Latest 3 shows</h2>
+        ${data.latest.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
+      </div>
+    </div>
   `;
 }
 
-async function renderSongStatus() {
-  const data = await api('/api/report/song-status');
+function journeyShowCard(sh) {
+  return `
+    <div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--line);">
+      <div style="font-weight:600;">${new Date(sh.date).toLocaleDateString()} — ${sh.venue}</div>
+      <div class="muted" style="margin-bottom:6px;">${[sh.city, sh.state].filter(Boolean).join(', ')}</div>
+      ${sh.artists.map(a => `<div class="muted">${a.orderLabel}: <span style="color:var(--text);">${a.artist}</span> — Opener: ${a.opener || '—'} · Closer: ${a.closer || '—'}</div>`).join('')}
+    </div>
+  `;
+}
+
+async function renderUnknowns() {
+  const data = await api(`/api/report/unknowns${companionsQuery()}`);
   const t = data.totals;
-  app.innerHTML = `
+  dashBody().innerHTML = `
     <div class="card">
-      <h2>Song status</h2>
+      <h2>Unknowns</h2>
       <div class="stat-grid" style="margin-bottom:16px;">
         <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
         <div class="stat-tile"><div class="num">${t.pct_missed || 0}%</div><div class="label">Missed</div></div>
         <div class="stat-tile"><div class="num">${t.pct_skipped || 0}%</div><div class="label">Skipped</div></div>
         <div class="stat-tile"><div class="num">${t.regret_count || 0}</div><div class="label">Regret</div></div>
       </div>
-      <div class="row" style="align-items:flex-start;gap:30px;">
-        <div style="flex:1;"><h2>Not known</h2>${data.notKnown.map(s => `<div class="muted">${s.title} — ${s.artist}</div>`).join('')}</div>
-        <div style="flex:1;"><h2>Regret</h2>${data.regret.map(s => `<div class="muted">${s.title} — ${s.artist}</div>`).join('')}</div>
-      </div>
+      <table>
+        <tr><th>Artist</th><th>Song</th><th>Regret</th></tr>
+        ${data.songs.map(s => `<tr><td>${s.artist}</td><td>${s.title}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td class="muted">None.</td></tr>'}
+      </table>
+    </div>
+  `;
+}
+
+async function renderSpotifyGaps() {
+  const data = await api(`/api/report/spotify-gaps${companionsQuery()}`);
+  dashBody().innerHTML = `
+    <div class="card">
+      <h2>Spotify Gaps</h2>
+      <p class="muted" style="margin-bottom:14px;">Songs you've seen live that never made it into a Spotify playlist — either from before the app (marked as not-on-Spotify in the historical import) or synced shows where no valid Spotify match was ever found (covers excluded).</p>
+      <table>
+        <tr><th>Artist</th><th>Song</th></tr>
+        ${data.songs.map(s => `<tr><td>${s.artist}</td><td>${s.title}</td></tr>`).join('') || '<tr><td class="muted">None — everything made it in.</td></tr>'}
+      </table>
     </div>
   `;
 }
