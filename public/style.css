@@ -1,0 +1,53 @@
+:root {
+  --bg: #0D0B14;
+  --surface: #171420;
+  --surface-2: #1F1A2C;
+  --line: #2C2640;
+  --violet: #B85CFF;
+  --amber: #F2A65A;
+  --text: #EDEAF2;
+  --muted: #8C82A6;
+  --danger: #E0556B;
+  --green: #4FBF8B;
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--line); flex-wrap: wrap; gap: 12px; }
+.brand { font-family: 'Oswald', sans-serif; font-weight: 700; letter-spacing: 0.08em; font-size: 20px; }
+.brand span { color: var(--violet); }
+.build-tag { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); letter-spacing: 0; margin-left: 6px; }
+.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+.nav.hidden { display: none; }
+.nav button { background: transparent; border: 1px solid var(--line); color: var(--muted); padding: 7px 12px; border-radius: 999px; font-family: 'Oswald', sans-serif; font-size: 12px; letter-spacing: 0.03em; cursor: pointer; text-transform: uppercase; }
+.nav button.active { background: var(--violet); color: #1a0d2e; border-color: var(--violet); }
+main { max-width: 1000px; margin: 0 auto; padding: 28px 20px 80px; }
+h1, h2, h3 { font-family: 'Oswald', sans-serif; font-weight: 600; margin: 0 0 12px; }
+h1 { font-size: 24px; }
+h2 { font-size: 13px; color: var(--violet); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }
+input, select { width: 100%; background: var(--surface-2); border: 1px solid var(--line); color: var(--text); padding: 9px 12px; border-radius: 6px; font-size: 14px; }
+input:focus, select:focus { outline: none; border-color: var(--violet); }
+button.btn { background: var(--violet); color: #1a0d2e; border: none; padding: 10px 16px; border-radius: 6px; font-family: 'Oswald', sans-serif; font-weight: 600; cursor: pointer; font-size: 13px; text-transform: uppercase; }
+button.btn.secondary { background: transparent; border: 1px solid var(--green); color: var(--green); }
+button.btn.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-family: 'JetBrains Mono', monospace; background: var(--surface-2); border: 1px solid var(--line); cursor: pointer; }
+.pill.on { background: var(--violet); color: #1a0d2e; border-color: var(--violet); }
+.pill.win { color: var(--green); border-color: var(--green); background: transparent; }
+.pill.loss { color: var(--danger); border-color: var(--danger); background: transparent; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); text-transform: uppercase; font-size: 10px; }
+.muted { color: var(--muted); font-size: 13px; }
+.error { color: var(--danger); font-size: 13px; margin-top: 6px; }
+.success { color: var(--green); font-size: 13px; margin-top: 6px; }
+.song-row { display: flex; align-items: center; gap: 10px; background: var(--surface-2); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; }
+.art { width: 40px; height: 40px; border-radius: 4px; background: var(--line); object-fit: cover; flex-shrink: 0; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.stat-tile { background: var(--surface-2); border-radius: var(--radius); padding: 14px; }
+.stat-tile .num { font-size: 22px; font-weight: 600; font-family: 'Oswald', sans-serif; }
+.stat-tile .label { font-size: 12px; color: var(--muted); }

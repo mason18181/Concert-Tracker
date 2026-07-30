@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Concert Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">CONCERT <span>TRACKER</span> <span class="build-tag">build v3</span></div>
+    <nav id="nav" class="nav hidden">
+      <button data-tab="sync">Sync</button>
+      <button data-tab="overview">Overview</button>
+      <button data-tab="yearly">Yearly</button>
+      <button data-tab="trends">Trends</button>
+      <button data-tab="travel">Travel</button>
+      <button data-tab="superlatives">Superlatives</button>
+      <button data-tab="songstatus">Song Status</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+  </header>
+  <main id="app"></main>
+  <script src="/app.js"></script>
+</body>
+</html>
