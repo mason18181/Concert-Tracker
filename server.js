@@ -196,7 +196,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/shows/:id', requireAuth, async (req, res) => {
+app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
   const showId = Number(req.params.id);
   const show = (await pool.query('SELECT * FROM shows WHERE id=$1', [showId])).rows[0];
   if (!show) return res.status(404).json({ error: 'Not found' });
