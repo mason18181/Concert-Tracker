@@ -60,7 +60,7 @@ th { color: var(--muted); text-transform: uppercase; font-size: 10px; }
 /* Dashboard subnav */
 .subnav { margin-bottom: 16px; }
 .sub-tab-btn { text-transform: none; }
-.sub-tab-btn.active { background: var(--violet); color: #1a0d2e; border-color: var(--violet); }
+button.btn.sub-tab-btn.active { background: var(--violet); color: #1a0d2e; border-color: var(--violet); }
 
 /* Attendee filter */
 .filter-bar { padding: 12px 20px; margin-bottom: 16px; }
