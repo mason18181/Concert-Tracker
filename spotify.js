@@ -148,4 +148,3 @@ async function removeTracksFromPlaylist(playlistId, trackUris) {
 }
 
 module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist, getPlaylistTrackIds, removeTracksFromPlaylist };
-
