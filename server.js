@@ -102,9 +102,10 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
 
       for (const artistBlock of show.artists) {
+        const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
         const artistRow = (await pool.query(
-          'INSERT INTO show_artists (show_id, artist, billing_order) VALUES ($1,$2,$3) RETURNING id',
-          [showRow.id, artistBlock.artist, artistBlock.billing_order]
+          'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+          [showRow.id, artistBlock.artist, artistBlock.billing_order, JSON.stringify(originalTitles), 'spreadsheet import']
         )).rows[0];
         for (const s of artistBlock.songs) {
           const song = await findOrCreateSong(artistBlock.artist, s.song);
@@ -158,8 +159,8 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 
     const songs = setlistfm.flattenSetlistSongs(entry);
     const artistRow = (await pool.query(
-      'INSERT INTO show_artists (show_id, artist, billing_order) VALUES ($1,$2,$3) RETURNING id',
-      [showRow.id, entry.artist.name, null]
+      'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm']
     )).rows[0];
 
     let order = 1;
@@ -207,11 +208,69 @@ app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
        FROM show_songs ss JOIN songs s ON s.id = ss.song_id
        WHERE ss.show_artist_id=$1 ORDER BY ss.play_order`, [a.id]
     )).rows;
+    a.diff = computeSetlistDiff(a.original_setlist, a.songs.map(s => s.title));
   }
   const companions = (await pool.query(
     `SELECT c.* FROM companions c JOIN show_companions sc ON sc.companion_id=c.id WHERE sc.show_id=$1`, [showId]
   )).rows;
   res.json({ ...show, artists, companions });
+});
+
+// Compares the current song order/composition against the original pull so
+// the tagging screen can show exactly what's actually been edited, instead
+// of leaving you to guess whether a swap or a cover exclusion is what made
+// the setlist "look" different.
+function computeSetlistDiff(original, current) {
+  if (!original) return null; // no baseline recorded (older data) — nothing to compare
+  const originalCounts = {};
+  original.forEach(t => { originalCounts[t] = (originalCounts[t] || 0) + 1; });
+  const currentCounts = {};
+  current.forEach(t => { currentCounts[t] = (currentCounts[t] || 0) + 1; });
+
+  const added = [];
+  for (const t of current) {
+    if ((currentCounts[t] > (originalCounts[t] || 0))) { added.push(t); currentCounts[t]--; }
+  }
+  const removed = [];
+  const remaining = { ...originalCounts };
+  current.forEach(t => { if (remaining[t] > 0) remaining[t]--; });
+  for (const t of original) {
+    if (remaining[t] > 0) { removed.push(t); remaining[t]--; }
+  }
+
+  const commonOriginalOrder = original.filter(t => current.includes(t));
+  const commonCurrentOrder = current.filter(t => original.includes(t));
+  const reordered = JSON.stringify(commonOriginalOrder) !== JSON.stringify(commonCurrentOrder);
+
+  return { added, removed, reordered, hasChanges: added.length > 0 || removed.length > 0 || reordered };
+}
+
+// Reassigns play_order 1..N to match the given sequence — used by the
+// move-up/move-down controls in the tagging screen.
+app.post('/api/show-artists/:id/reorder', requireAuth, async (req, res) => {
+  const { orderedShowSongIds } = req.body;
+  for (let i = 0; i < orderedShowSongIds.length; i++) {
+    await pool.query('UPDATE show_songs SET play_order=$1 WHERE id=$2', [i + 1, orderedShowSongIds[i]]);
+  }
+  res.json({ ok: true });
+});
+
+// Lets the user add a song the setlist pull missed entirely (rare, but
+// happens) — same effect as one coming in from setlist.fm, just typed
+// instead of pulled, and still runs through the normal master-list match.
+app.post('/api/show-artists/:id/add-song', requireAuth, async (req, res) => {
+  const showArtistId = Number(req.params.id);
+  const { title } = req.body;
+  if (!title || !title.trim()) return res.status(400).json({ error: 'Song title is required' });
+  const artistRow = (await pool.query('SELECT artist FROM show_artists WHERE id=$1', [showArtistId])).rows[0];
+  if (!artistRow) return res.status(404).json({ error: 'Show artist not found' });
+  const maxOrder = (await pool.query('SELECT COALESCE(max(play_order),0) AS m FROM show_songs WHERE show_artist_id=$1', [showArtistId])).rows[0].m;
+  const song = await findOrCreateSong(artistRow.artist, title.trim());
+  const inserted = (await pool.query(
+    `INSERT INTO show_songs (show_artist_id, song_id, play_order) VALUES ($1,$2,$3) RETURNING id`,
+    [showArtistId, song.id, Number(maxOrder) + 1]
+  )).rows[0];
+  res.json({ ok: true, showSongId: inserted.id, title: song.title, playOrder: Number(maxOrder) + 1 });
 });
 
 // ---------- tagging ----------
@@ -291,6 +350,14 @@ app.post('/api/shows/:id/fill-gap/apply', requireAuth, async (req, res) => {
       [showArtistId, song.id, order++, s.isCover]
     );
   }
+  // This is a deliberate wholesale replacement, not an ad-hoc edit — reset
+  // the diff baseline to the new pull so later small edits (a swap, a
+  // reorder) don't get misread as "most of the setlist was removed."
+  const sourceLabel = `filled in from ${setlist.eventDate} at ${setlist.venue.name}`;
+  await pool.query(
+    'UPDATE show_artists SET original_setlist=$1, setlist_source=$2 WHERE id=$3',
+    [JSON.stringify(songs.map(s => s.name)), sourceLabel, showArtistId]
+  );
   res.json({ ok: true, songCount: songs.length });
 });
 
@@ -320,9 +387,11 @@ app.get('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
   for (const song of rows) {
     if (song.spotify_status === 'pending') {
       let candidates = [];
-      try { candidates = await spotify.searchTrack(song.title, song.artist); } catch (e) { /* leave empty, user can search manually */ }
+      let searchError = null;
+      try { candidates = await spotify.searchTrack(song.title, song.artist); }
+      catch (e) { searchError = e.message; }
       const best = candidates[0];
-      out.push({ songId: song.id, showSongIds: song.show_song_ids, artist: song.artist, title: song.title, status: 'pending', candidates, suggested: best || null });
+      out.push({ songId: song.id, showSongIds: song.show_song_ids, artist: song.artist, title: song.title, status: 'pending', candidates, suggested: best || null, searchError });
     } else {
       out.push({
         songId: song.id, showSongIds: song.show_song_ids, artist: song.artist, title: song.title, status: song.spotify_status,
@@ -336,6 +405,28 @@ app.get('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
 app.post('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
   const { decisions } = req.body; // [{songId, action: 'approve'|'select'|'exclude', track?}]
   for (const d of decisions) {
+    const current = (await pool.query('SELECT spotify_track_id FROM songs WHERE id=$1', [d.songId])).rows[0];
+    const newTrackId = d.action === 'exclude' ? null : (d.track && d.track.id);
+    const changingTrack = current && current.spotify_track_id && current.spotify_track_id !== newTrackId;
+
+    if (changingTrack) {
+      // This song's match is shared across every show it appears in — pull
+      // the old track out of anywhere it was already pushed, everywhere,
+      // then let it get re-added fresh under the new match.
+      const targets = [
+        { key: 'seen', playlistId: (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0].seen_playlist_id },
+      ];
+      const cfg = (await pool.query('SELECT wes_playlist_id, dad_playlist_id FROM config WHERE id=1')).rows[0];
+      targets.push({ key: 'wes', playlistId: cfg.wes_playlist_id }, { key: 'dad', playlistId: cfg.dad_playlist_id });
+      const affected = (await pool.query('SELECT id, added_to_seen, added_to_wes, added_to_dad FROM show_songs WHERE song_id=$1', [d.songId])).rows;
+      for (const t of targets) {
+        if (affected.some(r => r[`added_to_${t.key}`])) {
+          try { await spotify.removeTracksFromPlaylist(t.playlistId, [`spotify:track:${current.spotify_track_id}`]); } catch (e) {}
+        }
+      }
+      await pool.query('UPDATE show_songs SET added_to_seen=false, added_to_wes=false, added_to_dad=false WHERE song_id=$1', [d.songId]);
+    }
+
     if (d.action === 'exclude') {
       await pool.query(`UPDATE songs SET spotify_status='excluded' WHERE id=$1`, [d.songId]);
     } else if (d.action === 'approve' || d.action === 'select') {
@@ -375,65 +466,92 @@ app.get('/api/shows/:id/playlist-preview', requireAuth, async (req, res) => {
 
 app.post('/api/shows/:id/playlist-submit', requireAuth, async (req, res) => {
   const showId = Number(req.params.id);
-  const { drops, swaps } = req.body; // drops: [showSongId], swaps: {showSongId: track}
-  for (const [showSongId, track] of Object.entries(swaps || {})) {
-    const row = (await pool.query('SELECT song_id FROM show_songs WHERE id=$1', [showSongId])).rows[0];
-    await pool.query(
-      `UPDATE songs SET spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
-      [track.id, track.name, track.albumName, track.albumArtUrl, row.song_id]
-    );
+  const { drops, skipSync } = req.body; // drops: [showSongId]
+  const targets = await playlistTargets(showId);
+
+  // A dropped song that had already made it into a playlist needs to come
+  // back out, not just stop being tracked.
+  const dropIds = (drops || []).map(Number).filter(Number.isFinite);
+  if (dropIds.length) {
+    const droppedRows = (await pool.query(
+      `SELECT ss.id, ss.added_to_seen, ss.added_to_wes, ss.added_to_dad, s.spotify_track_id
+       FROM show_songs ss JOIN songs s ON s.id=ss.song_id WHERE ss.id = ANY($1::int[])`, [dropIds]
+    )).rows;
+    if (!skipSync) {
+      for (const row of droppedRows) {
+        if (!row.spotify_track_id) continue;
+        for (const target of targets) {
+          if (row[`added_to_${target.key}`]) {
+            try { await spotify.removeTracksFromPlaylist(target.playlistId, [`spotify:track:${row.spotify_track_id}`]); } catch (e) {}
+          }
+        }
+      }
+    }
+    await pool.query(`UPDATE show_songs SET added_to_seen=false, added_to_wes=false, added_to_dad=false WHERE id = ANY($1::int[])`, [dropIds]);
   }
 
-  const targets = await playlistTargets(showId);
+  if (skipSync) {
+    // Dataset changes are saved (above), but nothing gets pushed to Spotify.
+    // Leaving added_to_* flags as-is means anything genuinely out of sync
+    // will surface again on its own via "Playlist updates needed."
+    await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
+    return res.json({ ok: true, added: 0, skipped: true });
+  }
+
   const songs = (await pool.query(
     `SELECT ss.id AS show_song_id, s.spotify_track_id, ss.added_to_seen, ss.added_to_wes, ss.added_to_dad
      FROM show_songs ss JOIN songs s ON s.id=ss.song_id JOIN show_artists sa ON sa.id=ss.show_artist_id
      WHERE sa.show_id=$1 AND s.spotify_status IN ('matched','assumed_added') AND s.spotify_track_id IS NOT NULL`, [showId]
   )).rows;
-  const dropSet = new Set((drops || []).map(String));
+  const dropSet = new Set(dropIds.map(String));
   const keep = songs.filter(s => !dropSet.has(String(s.show_song_id)));
 
+  let added = 0;
   for (const target of targets) {
     const flagCol = `added_to_${target.key}`;
-    const uris = keep.filter(s => !s[flagCol]).map(s => `spotify:track:${s.spotify_track_id}`);
+    // Only the songs actually missing this specific playlist get pushed —
+    // already-added songs are left alone, not resent.
+    const toAdd = keep.filter(s => !s[flagCol]);
+    const uris = toAdd.map(s => `spotify:track:${s.spotify_track_id}`);
     await spotify.addTracksToPlaylist(target.playlistId, uris);
-    for (const s of keep) {
+    added += toAdd.length;
+    for (const s of toAdd) {
       await pool.query(`UPDATE show_songs SET ${flagCol}=true WHERE id=$1`, [s.show_song_id]);
     }
   }
 
   await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
-  res.json({ ok: true, added: keep.length });
+  res.json({ ok: true, added });
 });
 
 // A show needs a playlist push (without redoing tagging/review) whenever it
-// has a song that's matched on Spotify but hasn't made it into every
-// playlist that show belongs in — most commonly because the song was
-// re-matched after the fact (see /api/spotify/recheck-excluded below).
+// has a song that's matched on Spotify but hasn't made it into a playlist
+// that show actually belongs in — scoped per-show to only the playlists
+// that show's own companions make applicable (a show with no Wes/Jeff
+// companion never "needs" the Wes/Dad flags, since those simply don't apply
+// to it and are never expected to be true).
 app.get('/api/shows/needs-playlist-update', requireAuth, async (req, res) => {
-  const candidates = (await pool.query(`
+  const rows = (await pool.query(`
     SELECT DISTINCT sh.id, sh.date, sh.venue
     FROM shows sh
     JOIN show_artists sa ON sa.show_id = sh.id
     JOIN show_songs ss ON ss.show_artist_id = sa.id
     JOIN songs s ON s.id = ss.song_id
     WHERE s.spotify_status IN ('matched','assumed_added')
-      AND (NOT ss.added_to_seen OR NOT ss.added_to_wes OR NOT ss.added_to_dad)
+      AND (
+        (NOT ss.added_to_seen)
+        OR (NOT ss.added_to_wes AND EXISTS (
+          SELECT 1 FROM show_companions sc JOIN companions c ON c.id=sc.companion_id
+          WHERE sc.show_id=sh.id AND c.name='Wes'
+        ))
+        OR (NOT ss.added_to_dad AND EXISTS (
+          SELECT 1 FROM show_companions sc JOIN companions c ON c.id=sc.companion_id
+          WHERE sc.show_id=sh.id AND c.name='Jeff'
+        ))
+      )
     ORDER BY sh.date DESC
   `)).rows;
-
-  const needing = [];
-  for (const c of candidates) {
-    const targets = await playlistTargets(c.id);
-    const songs = (await pool.query(
-      `SELECT ss.added_to_seen, ss.added_to_wes, ss.added_to_dad
-       FROM show_songs ss JOIN show_artists sa ON sa.id=ss.show_artist_id JOIN songs s ON s.id=ss.song_id
-       WHERE sa.show_id=$1 AND s.spotify_status IN ('matched','assumed_added')`, [c.id]
-    )).rows;
-    const pending = songs.some(s => targets.some(t => !s[`added_to_${t.key}`]));
-    if (pending) needing.push({ id: c.id, date: c.date, venue: c.venue });
-  }
-  res.json(needing);
+  res.json(rows);
 });
 
 // Re-searches Spotify for every song currently marked "excluded" — for when
@@ -680,7 +798,7 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
     return {
       artist: a.artist,
       timesSeen: a.timesSeen,
-      songCount: Number(sc.unique_songs),
+      songCount: Number(sc.total_slots),
       pctHeadline: Math.round(100 * a.headlineCount / a.timesSeen * 10) / 10,
       setlistVariationPct: sc.total_slots ? Math.round(100 * sc.unique_songs / sc.total_slots * 10) / 10 : 0,
       openCloseVariationPct,
@@ -688,10 +806,33 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
   }).sort((a, b) => b.timesSeen - a.timesSeen).slice(0, 10);
 
   const repeatArtists = Object.values(byArtist).filter(a => a.timesSeen > 1);
+
+  // "Most new songs vs. the immediately-preceding time you saw them" — for
+  // each artist you've seen more than once, compare every show to the one
+  // right before it chronologically (show 2 vs show 1, show 3 vs show 2,
+  // etc.) and take that artist's single biggest new-song count from any one
+  // of those comparisons.
+  const artistShowSongs = (await pool.query(`
+    SELECT sa.artist, sh.date, array_agg(DISTINCT ss.song_id) AS song_ids
+    FROM show_artists sa
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN show_songs ss ON ss.show_artist_id = sa.id
+    WHERE ${filterClause}
+    GROUP BY sa.artist, sh.date
+    ORDER BY sa.artist, sh.date
+  `, [cIds])).rows;
+  const showsByArtist = {};
+  for (const r of artistShowSongs) (showsByArtist[r.artist] = showsByArtist[r.artist] || []).push(r.song_ids.map(Number));
   const mostUniqueSongsRepeat = repeatArtists.map(a => {
-    const sc = songCountByArtist[a.artist] || { unique_songs: 0 };
-    return { artist: a.artist, timesSeen: a.timesSeen, uniqueSongs: Number(sc.unique_songs) };
-  }).sort((a, b) => b.uniqueSongs - a.uniqueSongs).slice(0, 5);
+    const shows = showsByArtist[a.artist] || [];
+    let best = 0;
+    for (let i = 1; i < shows.length; i++) {
+      const prevSet = new Set(shows[i - 1]);
+      const newCount = shows[i].filter(id => !prevSet.has(id)).length;
+      if (newCount > best) best = newCount;
+    }
+    return { artist: a.artist, timesSeen: a.timesSeen, newSongsInASet: best };
+  }).sort((a, b) => b.newSongsInASet - a.newSongsInASet).slice(0, 5);
 
   const mostOpenCloseVariation = repeatArtists.map(a => ({
     artist: a.artist,
@@ -699,7 +840,15 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
     openCloseVariationPct: Math.round(100 * ((a.openers.size + a.closers.size) / (2 * a.timesSeen)) * 10) / 10,
   })).sort((a, b) => b.openCloseVariationPct - a.openCloseVariationPct).slice(0, 5);
 
-  res.json({ bandsSeenMost, mostUniqueSongsRepeat, mostOpenCloseVariation });
+  const mostSongsInSet = (await pool.query(`
+    SELECT sh.date, sa.artist, count(*) AS song_count
+    FROM shows sh JOIN show_artists sa ON sa.show_id = sh.id JOIN show_songs ss ON ss.show_artist_id = sa.id
+    WHERE ${filterClause}
+    GROUP BY sh.date, sa.artist, sa.id
+    ORDER BY song_count DESC LIMIT 10
+  `, [cIds])).rows.map(r => ({ date: r.date, artist: r.artist, songCount: Number(r.song_count) }));
+
+  res.json({ bandsSeenMost, mostUniqueSongsRepeat, mostOpenCloseVariation, mostSongsInSet });
 });
 
 app.get('/api/report/journey', requireAuth, async (req, res) => {
@@ -711,7 +860,7 @@ app.get('/api/report/journey', requireAuth, async (req, res) => {
   )).rows.map(r => r.id);
   const lastIds = (await pool.query(
     `SELECT id FROM shows sh WHERE ${filterClause} ORDER BY date DESC, id DESC LIMIT 3`, [cIds]
-  )).rows.map(r => r.id).reverse();
+  )).rows.map(r => r.id);
 
   const allShows = await getShowsNested({ cIds, showIds: [...firstIds, ...lastIds] });
   const byId = Object.fromEntries(allShows.map(s => [s.id, s]));
@@ -739,6 +888,7 @@ app.get('/api/report/unknowns', requireAuth, async (req, res) => {
     SELECT s.artist, s.title, bool_or(${REGRET_SQL}) AS regret
     FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id=ss.song_id
     WHERE NOT ss.known AND ${filterClause}
+      AND NOT EXISTS (SELECT 1 FROM show_songs ss2 WHERE ss2.song_id = ss.song_id AND ss2.known = true)
     GROUP BY s.id, s.artist, s.title
     ORDER BY regret DESC, s.artist ASC, s.title ASC
     LIMIT 500
@@ -766,6 +916,7 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
       JOIN songs s ON s.id = ss.song_id
       WHERE sh.setlistfm_event_id IS NULL
         AND ss.already_on_spotify = false
+        AND ss.status = 'seen'
         AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
       UNION
       SELECT s.artist, s.title
@@ -775,6 +926,7 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
       JOIN songs s ON s.id = ss.song_id
       WHERE sh.setlistfm_event_id IS NOT NULL
         AND s.spotify_status = 'excluded'
+        AND ss.status = 'seen'
         AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
     ) gaps
     ORDER BY artist ASC, title ASC
@@ -782,33 +934,150 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
   res.json({ songs: rows });
 });
 
+// Re-searches every gap song on Spotify, and where a match now exists,
+// checks it against what's ACTUALLY in each of the three real playlists
+// (not just this app's own added_to_* bookkeeping) before deciding what to
+// do: if it's already sitting in a playlist, that just means the app's
+// records were stale — mark it as added and move on, no Spotify write. If
+// it's genuinely missing, surface it for you to approve on the Sync page.
+// Missed/chose-not-to-see songs are excluded from the base gaps query
+// already, so they never reach this check either.
+app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: cfg.seen_playlist_id },
+    { key: 'wes', playlistId: cfg.wes_playlist_id },
+    { key: 'dad', playlistId: cfg.dad_playlist_id },
+  ];
+  const playlistIdSets = {};
+  for (const t of targetDefs) {
+    try { playlistIdSets[t.key] = await spotify.getPlaylistTrackIds(t.playlistId); }
+    catch (e) { playlistIdSets[t.key] = new Set(); }
+  }
+
+  const gapSongs = (await pool.query(`
+    SELECT DISTINCT s.id, s.artist, s.title
+    FROM show_songs ss
+    JOIN show_artists sa ON sa.id = ss.show_artist_id
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen'
+      AND ((sh.setlistfm_event_id IS NULL AND ss.already_on_spotify = false) OR s.spotify_status = 'excluded')
+  `)).rows;
+
+  let autoMarked = 0;
+  const needsAddition = [];
+
+  for (const song of gapSongs) {
+    // Which playlists does this song actually belong in, across every show it appears at?
+    const companionRows = (await pool.query(`
+      SELECT DISTINCT c.name FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN show_companions sc ON sc.show_id = sa.show_id
+      JOIN companions c ON c.id = sc.companion_id
+      WHERE ss.song_id = $1
+    `, [song.id])).rows.map(r => r.name);
+    const applicableTargets = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
+
+    let candidates = [];
+    try { candidates = await spotify.searchTrack(song.title, song.artist); } catch (e) { continue; }
+    const best = candidates[0];
+    if (!best) continue;
+
+    const missingFrom = applicableTargets.filter(t => !playlistIdSets[t.key].has(best.id));
+    const alreadyIn = applicableTargets.filter(t => playlistIdSets[t.key].has(best.id));
+
+    if (alreadyIn.length) {
+      // The playlist already has it — the dataset was just out of date.
+      await pool.query(
+        `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+        [best.id, best.name, best.albumName, best.albumArtUrl, song.id]
+      );
+      for (const t of alreadyIn) {
+        await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${t.key}=true WHERE song_id=$1`, [song.id]);
+      }
+      autoMarked++;
+    }
+    if (missingFrom.length) {
+      needsAddition.push({
+        songId: song.id, artist: song.artist, title: song.title, track: best,
+        targets: missingFrom.map(t => t.key),
+      });
+    }
+  }
+
+  res.json({ autoMarked, needsAddition });
+});
+
+app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
+  const { additions } = req.body; // [{songId, track, targets: ['seen','wes','dad']}]
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const playlistIds = { seen: cfg.seen_playlist_id, wes: cfg.wes_playlist_id, dad: cfg.dad_playlist_id };
+
+  const byTarget = { seen: [], wes: [], dad: [] };
+  for (const a of additions || []) {
+    await pool.query(
+      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+      [a.track.id, a.track.name, a.track.albumName, a.track.albumArtUrl, a.songId]
+    );
+    for (const key of a.targets) byTarget[key].push(a);
+  }
+  let added = 0;
+  for (const key of ['seen', 'wes', 'dad']) {
+    const items = byTarget[key];
+    if (!items.length) continue;
+    await spotify.addTracksToPlaylist(playlistIds[key], items.map(a => `spotify:track:${a.track.id}`));
+    for (const a of items) {
+      await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${key}=true WHERE song_id=$1`, [a.songId]);
+    }
+    added += items.length;
+  }
+  res.json({ ok: true, added });
+});
+
 // One-off maintenance: retries geocoding/driving-distance for any show
-// still missing miles/minutes (usually a transient ORS failure during
-// import), so travel rollups aren't silently short.
+// still missing miles/minutes. Falls back to the default home address when
+// a show has no origin_address of its own set yet, and reports exactly why
+// any show is still failing instead of a silent count.
 app.post('/api/admin/backfill-travel', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT default_origin_address FROM config WHERE id=1')).rows[0];
   const missing = (await pool.query(
-    `SELECT id, origin_address, venue, city, state, venue_lat, venue_lng FROM shows WHERE (distance_miles IS NULL OR duration_minutes IS NULL) AND origin_address IS NOT NULL`
+    `SELECT id, origin_address, venue, city, state, venue_lat, venue_lng FROM shows WHERE distance_miles IS NULL OR duration_minutes IS NULL`
   )).rows;
-  let fixed = 0, stillMissing = 0;
+  let fixed = 0;
+  const failures = [];
   for (const sh of missing) {
+    const originAddress = sh.origin_address || cfg.default_origin_address;
+    if (!originAddress) {
+      failures.push({ id: sh.id, venue: sh.venue, reason: 'No origin address on this show, and no default home address set in Settings.' });
+      continue;
+    }
     try {
       let venueCoord = (sh.venue_lat && sh.venue_lng) ? { lat: sh.venue_lat, lng: sh.venue_lng } : null;
       if (!venueCoord) {
         venueCoord = await ors.geocode(`${sh.venue}, ${sh.city}, ${sh.state || ''}`);
         if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, sh.id]);
       }
-      const originCoord = await ors.geocode(sh.origin_address);
-      if (venueCoord && originCoord) {
-        const distance = await ors.drivingDistance(originCoord, venueCoord);
-        await pool.query(
-          'UPDATE shows SET origin_lat=$1, origin_lng=$2, distance_miles=$3, duration_minutes=$4 WHERE id=$5',
-          [originCoord.lat, originCoord.lng, distance.miles, distance.minutes, sh.id]
-        );
-        fixed++;
-      } else stillMissing++;
-    } catch (e) { stillMissing++; }
+      if (!venueCoord) {
+        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find "${sh.venue}, ${sh.city || ''}".` });
+        continue;
+      }
+      const originCoord = await ors.geocode(originAddress);
+      if (!originCoord) {
+        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find the starting address "${originAddress}".` });
+        continue;
+      }
+      const distance = await ors.drivingDistance(originCoord, venueCoord);
+      await pool.query(
+        'UPDATE shows SET origin_address=$1, origin_lat=$2, origin_lng=$3, distance_miles=$4, duration_minutes=$5 WHERE id=$6',
+        [originAddress, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, sh.id]
+      );
+      fixed++;
+    } catch (e) {
+      failures.push({ id: sh.id, venue: sh.venue, reason: e.message });
+    }
   }
-  res.json({ ok: true, fixed, stillMissing, checked: missing.length });
+  res.json({ ok: true, fixed, checked: missing.length, stillMissing: failures.length, failures });
 });
 
 const PORT = process.env.PORT || 3000;
