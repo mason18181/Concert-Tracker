@@ -116,4 +116,36 @@ async function addTracksToPlaylist(playlistId, trackUris) {
   }
 }
 
-module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist };
+async function getPlaylistTrackIds(playlistId) {
+  if (!playlistId) return new Set();
+  const token = await getAccessToken();
+  const ids = new Set();
+  let url = `${API_BASE}/playlists/${playlistId}/tracks?fields=next,items(track(id))&limit=100`;
+  while (url) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Spotify playlist read failed: ${await res.text()}`);
+    const data = await res.json();
+    for (const item of data.items || []) {
+      if (item.track && item.track.id) ids.add(item.track.id);
+    }
+    url = data.next;
+  }
+  return ids;
+}
+
+async function removeTracksFromPlaylist(playlistId, trackUris) {
+  if (!playlistId || !trackUris.length) return;
+  const token = await getAccessToken();
+  for (let i = 0; i < trackUris.length; i += 100) {
+    const batch = trackUris.slice(i, i + 100);
+    const res = await fetch(`${API_BASE}/playlists/${playlistId}/tracks`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tracks: batch.map(uri => ({ uri })) }),
+    });
+    if (!res.ok) throw new Error(`Spotify remove-from-playlist failed: ${await res.text()}`);
+  }
+}
+
+module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist, getPlaylistTrackIds, removeTracksFromPlaylist };
+
