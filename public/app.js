@@ -7,6 +7,18 @@ let dashboardSubtab = 'overview'; // overview | trends | travel | superlatives |
 let selectedCompanionIds = new Set(); // empty == "All"
 let allCompanions = [];
 
+// Track candidates get referenced by key instead of embedding their JSON
+// directly in HTML attributes — any apostrophe in an artist/album/track name
+// (extremely common: "Guns N' Roses", "Don't...", etc.) breaks a
+// single-quoted HTML attribute, so this sidesteps that whole class of bug.
+let candidateStore = {};
+let candidateKeyCounter = 0;
+function stashCandidate(candidate) {
+  const key = `c${candidateKeyCounter++}`;
+  candidateStore[key] = candidate;
+  return key;
+}
+
 const DASHBOARD_SUBTABS = [
   ['overview', 'Overview'],
   ['trends', 'Trends'],
@@ -155,6 +167,7 @@ function renderLoginGate() {
 
 function renderTab() {
   setNavActive();
+  candidateStore = {};
   if (wizardShowId) return renderWizard();
   if (activeTab === 'sync') return renderSync();
   if (activeTab === 'dashboard') return renderDashboard();
@@ -184,14 +197,14 @@ async function renderSettings() {
       <h2>Default travel origin</h2>
       <div class="field"><label>Home address</label><input id="origin" value="${s.defaultOriginAddress || ''}" /></div>
     </div>
-    <div class="card">
+    <button class="btn" id="save-settings-btn">Save settings</button>
+    <div class="success" id="settings-ok"></div>
+    <div class="card" style="margin-top:20px;">
       <h2>Historical import</h2>
       <p class="muted">One-time: loads your 59 historical shows into the database. Safe to click more than once — already-imported shows are skipped.</p>
       <button class="btn secondary" id="import-btn">Run historical import</button>
       <div class="muted" id="import-status" style="margin-top:8px;"></div>
     </div>
-    <button class="btn" id="save-settings-btn">Save settings</button>
-    <div class="success" id="settings-ok"></div>
     <div class="card">
       <h2>Session</h2>
       <button class="btn danger" id="lock-btn">Lock app</button>
@@ -238,19 +251,18 @@ async function renderSync() {
       <h2>Sync</h2>
       <button class="btn" id="sync-btn">Check for new shows</button>
       <div class="muted" id="sync-status" style="margin-top:8px;"></div>
-    </div>
-    <div class="card">
-      <h2>Needs attention (${pending.length})</h2>
-      ${pending.length ? pending.map(s => `
-        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
-          <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue} <span class="muted">(${s.stage})</span></div>
-          <button class="btn secondary" data-show="${s.id}" data-stage="${s.stage === 'new' ? 'tag' : s.stage === 'tagged' ? 'spotify' : 'playlist'}">Continue</button>
-        </div>
-      `).join('') : '<p class="muted">Nothing pending.</p>'}
+      <div id="pending-list" style="margin-top:12px;">
+        ${pending.length ? pending.map(s => `
+          <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
+            <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue} <span class="muted">(${s.stage})</span></div>
+            <button class="btn secondary" data-show="${s.id}" data-stage="${s.stage === 'new' ? 'tag' : s.stage === 'tagged' ? 'spotify' : 'playlist'}">Continue</button>
+          </div>
+        `).join('') : '<p class="muted">Nothing pending.</p>'}
+      </div>
     </div>
     <div class="card">
       <h2>Playlist updates needed (${needsPlaylistUpdate.length})</h2>
-      <p class="muted" style="margin-bottom:10px;">Songs that are now matched on Spotify but haven't made it into their playlist(s) yet — usually because a match was found after the show was already marked complete.</p>
+      <p class="muted" style="margin-bottom:10px;">Songs that are now matched on Spotify but haven't made it into their playlist(s) yet.</p>
       ${needsPlaylistUpdate.length ? needsPlaylistUpdate.map(s => `
         <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
           <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue}</div>
@@ -263,6 +275,12 @@ async function renderSync() {
       <p class="muted" style="margin-bottom:10px;">If a band releases an official version of a song after you saw it live, run this to see if it's findable now.</p>
       <button class="btn secondary" id="recheck-btn">Recheck excluded songs</button>
       <div id="recheck-results" style="margin-top:12px;"></div>
+    </div>
+    <div class="card">
+      <h2>Spotify gaps check</h2>
+      <p class="muted" style="margin-bottom:10px;">Re-checks every song that's never made it into a playlist. Anything that turns out to already be in the right playlist gets marked as such automatically (your dataset was just out of date) — anything genuinely missing shows up below for you to approve.</p>
+      <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
+      <div id="gapcheck-results" style="margin-top:12px;"></div>
     </div>
     <div class="card">
       <h2>All shows (edit)</h2>
@@ -289,7 +307,50 @@ async function renderSync() {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
   document.getElementById('recheck-btn').onclick = () => runSpotifyRecheck();
+  document.getElementById('gapcheck-btn').onclick = () => runGapCheck();
   wireAllShowsBrowser();
+}
+
+async function runGapCheck() {
+  const resultsEl = document.getElementById('gapcheck-results');
+  resultsEl.innerHTML = '<p class="muted">Checking gap songs against your actual playlists — this can take a minute...</p>';
+  try {
+    const r = await api('/api/spotify/gap-check');
+    const parts = [];
+    if (r.autoMarked) parts.push(`<p class="success">${r.autoMarked} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
+    if (!r.needsAddition.length) {
+      if (!r.autoMarked) parts.push('<p class="muted">Nothing missing.</p>');
+      resultsEl.innerHTML = parts.join('');
+      return;
+    }
+    parts.push(`<div id="gap-additions">${r.needsAddition.map(a => `
+      <div class="song-row" data-gap-song="${a.songId}">
+        <img class="art" src="${a.track.albumArtUrl || ''}" />
+        <div style="flex:1;min-width:0;">
+          <div>${a.title} — ${a.artist}</div>
+          <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
+        </div>
+        <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
+      </div>
+    `).join('')}</div>
+    <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${r.needsAddition.length} song(s) to playlists</button>`);
+    resultsEl.innerHTML = parts.join('');
+
+    const skipped = new Set();
+    resultsEl.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
+      skipped.add(Number(btn.dataset.gapDrop));
+      btn.closest('.song-row').style.opacity = '0.3';
+      btn.disabled = true;
+    });
+    document.getElementById('apply-gap-additions-btn').onclick = async () => {
+      const additions = r.needsAddition.filter(a => !skipped.has(a.songId));
+      try {
+        const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions } });
+        resultsEl.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
+        renderSync();
+      } catch (e) { showModal(e.message, { title: 'Error' }); }
+    };
+  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
 }
 
 async function runSpotifyRecheck() {
@@ -302,13 +363,14 @@ async function runSpotifyRecheck() {
       <div id="recheck-${r.songId}" style="margin-bottom:10px;">
         <div class="muted" style="margin-bottom:4px;">${r.title} — ${r.artist}</div>
         <div class="row">
-          ${r.candidates.map(c => `<button class="btn secondary" data-recheck-pick='${JSON.stringify({ songId: r.songId, track: c })}'>${c.albumName}</button>`).join('')}
+          ${r.candidates.map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-recheck-pick="${r.songId}">${c.albumName}</button>`).join('')}
           <button class="btn danger" data-recheck-skip="${r.songId}">Still not it</button>
         </div>
       </div>
     `).join('');
     resultsEl.querySelectorAll('[data-recheck-pick]').forEach(btn => btn.onclick = async () => {
-      const { songId, track } = JSON.parse(btn.dataset.recheckPick);
+      const songId = Number(btn.dataset.recheckPick);
+      const track = candidateStore[btn.dataset.candidateKey];
       await api('/api/spotify/recheck-excluded/apply', { method: 'POST', body: { songId, track } });
       document.getElementById(`recheck-${songId}`).innerHTML = '<p class="success">Matched — check "Playlist updates needed" above.</p>';
       renderSync();
@@ -362,12 +424,30 @@ async function renderTagStage(show) {
       ${show.artists.map(a => `
         <div style="margin-bottom:14px;">
           <div style="font-weight:500;margin-bottom:6px;">${a.artist}</div>
-          <div class="row" style="margin-bottom:8px;"><button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Fill gap from another show</button></div>
-          <table>
+          ${a.setlist_source && a.setlist_source !== 'setlist.fm' ? `<p class="muted" style="margin-bottom:6px;">Source: ${a.setlist_source}</p>` : ''}
+          ${a.diff && a.diff.hasChanges ? `
+            <div class="muted" style="margin-bottom:8px;padding:8px 10px;background:var(--surface-2);border-radius:6px;">
+              Changed from the original pull:
+              ${a.diff.added.length ? ` added ${a.diff.added.join(', ')}.` : ''}
+              ${a.diff.removed.length ? ` removed ${a.diff.removed.join(', ')}.` : ''}
+              ${a.diff.reordered ? ` song order changed.` : ''}
+            </div>
+          ` : ''}
+          <div class="row" style="margin-bottom:8px;">
+            <button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Fill gap from another show</button>
+            <input id="new-song-${a.id}" placeholder="Song title..." style="max-width:220px;" />
+            <button class="btn secondary" data-add-song="${a.id}">Add song</button>
+          </div>
+          <table data-artist-table="${a.id}">
             <tr><th>#</th><th>Song</th><th>Cover</th><th>Known</th><th>Status</th><th>Regret-eligible</th><th></th></tr>
-            ${a.songs.map(s => `
+            ${a.songs.map((s, i) => `
               <tr data-song-row="${s.id}">
-                <td>${s.play_order}</td><td>${s.title}</td>
+                <td style="white-space:nowrap;">
+                  <button class="btn secondary" data-move-up="${s.id}" data-artist-id="${a.id}" style="padding:2px 6px;font-size:11px;" ${i === 0 ? 'disabled' : ''}>&uarr;</button>
+                  <button class="btn secondary" data-move-down="${s.id}" data-artist-id="${a.id}" style="padding:2px 6px;font-size:11px;" ${i === a.songs.length - 1 ? 'disabled' : ''}>&darr;</button>
+                  <span class="order-num">${s.play_order}</span>
+                </td>
+                <td>${s.title}</td>
                 <td>${s.is_cover ? '<span class="pill">cover</span>' : ''}</td>
                 <td><span class="pill known-pill ${s.known ? 'on' : ''}" data-toggle="known">${s.known ? 'Yes' : 'No'}</span></td>
                 <td>
@@ -404,11 +484,77 @@ async function renderTagStage(show) {
   app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('.pill[data-companion]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('[data-fillgap]').forEach(btn => btn.onclick = () => openFillGap(btn.dataset.fillgap, btn.dataset.artist));
+
+  function refreshRowControls(table) {
+    const rows = [...table.querySelectorAll('tr[data-song-row]')];
+    rows.forEach((tr, i) => {
+      tr.querySelector('.order-num').textContent = i + 1;
+      tr.querySelector('[data-move-up]').disabled = i === 0;
+      tr.querySelector('[data-move-down]').disabled = i === rows.length - 1;
+    });
+  }
+  async function persistOrder(table) {
+    const orderedShowSongIds = [...table.querySelectorAll('tr[data-song-row]')].map(tr => Number(tr.dataset.songRow));
+    const artistId = table.dataset.artistTable;
+    try { await api(`/api/show-artists/${artistId}/reorder`, { method: 'POST', body: { orderedShowSongIds } }); }
+    catch (e) { showModal(e.message, { title: 'Error' }); }
+  }
+  function wireMoveButtons(table) {
+    table.querySelectorAll('[data-move-up]').forEach(btn => btn.onclick = () => {
+      const tr = btn.closest('tr');
+      const prev = tr.previousElementSibling;
+      if (prev && prev.dataset.songRow) { table.insertBefore(tr, prev); refreshRowControls(table); persistOrder(table); }
+    });
+    table.querySelectorAll('[data-move-down]').forEach(btn => btn.onclick = () => {
+      const tr = btn.closest('tr');
+      const next = tr.nextElementSibling;
+      if (next && next.dataset.songRow) { table.insertBefore(next, tr); refreshRowControls(table); persistOrder(table); }
+    });
+  }
+  app.querySelectorAll('table[data-artist-table]').forEach(wireMoveButtons);
+
+  app.querySelectorAll('[data-add-song]').forEach(btn => btn.onclick = async () => {
+    const input = document.getElementById(`new-song-${btn.dataset.addSong}`);
+    const title = input.value.trim();
+    if (!title) return;
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/show-artists/${btn.dataset.addSong}/add-song`, { method: 'POST', body: { title } });
+      const table = document.querySelector(`table[data-artist-table="${btn.dataset.addSong}"]`);
+      const tr = document.createElement('tr');
+      tr.dataset.songRow = r.showSongId;
+      tr.innerHTML = `
+        <td style="white-space:nowrap;">
+          <button class="btn secondary" data-move-up style="padding:2px 6px;font-size:11px;">&uarr;</button>
+          <button class="btn secondary" data-move-down style="padding:2px 6px;font-size:11px;" disabled>&darr;</button>
+          <span class="order-num">${r.playOrder}</span>
+        </td>
+        <td>${r.title}</td><td></td>
+        <td><span class="pill known-pill" data-toggle="known">No</span></td>
+        <td><select class="status-select"><option value="seen" selected>Seen</option><option value="missed">Missed</option><option value="skipped">Chose not to see</option></select></td>
+        <td><span class="pill liked-pill" data-toggle="liked">No</span></td>
+        <td><button class="btn danger" data-remove-song="${r.showSongId}" style="padding:4px 8px;font-size:11px;">Remove</button></td>
+      `;
+      table.appendChild(tr);
+      refreshRowControls(table);
+      wireMoveButtons(table);
+      tr.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
+      tr.querySelector('[data-remove-song]').onclick = async () => {
+        if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
+        try { await api(`/api/show-songs/${r.showSongId}/remove`, { method: 'POST' }); tr.remove(); refreshRowControls(table); }
+        catch (e) { alert(e.message); }
+      };
+      input.value = '';
+    } catch (e) { showModal(e.message, { title: 'Error' }); }
+    btn.disabled = false;
+  });
   app.querySelectorAll('[data-remove-song]').forEach(btn => btn.onclick = async () => {
     if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
     try {
       await api(`/api/show-songs/${btn.dataset.removeSong}/remove`, { method: 'POST' });
+      const table = btn.closest('table');
       btn.closest('tr').remove();
+      refreshRowControls(table);
     } catch (e) { alert(e.message); }
   });
 
@@ -446,21 +592,40 @@ async function renderTagStage(show) {
 }
 
 async function openFillGap(showArtistId, artistName) {
-  const results = await api(`/api/shows/${wizardShowId}/fill-gap/search`, { method: 'POST', body: { artistName } });
-  const list = results.slice(0, 8).map(r => `<div class="row" style="justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-box" style="max-width:520px;text-align:left;max-height:80vh;overflow-y:auto;">
+      <h2>Other ${artistName} setlists</h2>
+      <div id="fillgap-list"><p class="muted">Searching setlist.fm...</p></div>
+      <button class="btn secondary" id="close-fillgap" style="margin-top:14px;">Cancel</button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  const closeModal = () => modal.remove();
+  modal.querySelector('#close-fillgap').onclick = closeModal;
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  let results = [];
+  try {
+    results = await api(`/api/shows/${wizardShowId}/fill-gap/search`, { method: 'POST', body: { artistName } });
+  } catch (e) {
+    modal.querySelector('#fillgap-list').innerHTML = `<p class="error">${e.message}</p>`;
+    return;
+  }
+  const listEl = modal.querySelector('#fillgap-list');
+  listEl.innerHTML = results.slice(0, 8).map(r => `<div class="row" style="justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
     <span>${r.date} — ${r.venue}, ${r.city} (${r.songCount} songs)</span>
     <button class="btn secondary" data-apply-setlist="${r.id}">Use this</button>
-  </div>`).join('');
-  const modal = document.createElement('div');
-  modal.className = 'card';
-  modal.style = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:50;max-width:500px;width:90%;';
-  modal.innerHTML = `<h2>Other ${artistName} setlists</h2>${list || '<p class="muted">No results.</p>'}<button class="btn secondary" id="close-fillgap">Close</button>`;
-  document.body.appendChild(modal);
-  modal.querySelector('#close-fillgap').onclick = () => modal.remove();
-  modal.querySelectorAll('[data-apply-setlist]').forEach(btn => btn.onclick = async () => {
-    await api(`/api/shows/${wizardShowId}/fill-gap/apply`, { method: 'POST', body: { setlistId: btn.dataset.applySetlist, showArtistId: Number(showArtistId), artistName } });
-    modal.remove();
-    renderWizard();
+  </div>`).join('') || '<p class="muted">No results.</p>';
+  listEl.querySelectorAll('[data-apply-setlist]').forEach(btn => btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = 'Applying...';
+    try {
+      await api(`/api/shows/${wizardShowId}/fill-gap/apply`, { method: 'POST', body: { setlistId: btn.dataset.applySetlist, showArtistId: Number(showArtistId), artistName } });
+      closeModal();
+      renderWizard();
+    } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; btn.textContent = 'Use this'; }
   });
 }
 
@@ -481,7 +646,8 @@ async function renderSpotifyStage(show) {
     const rowEl = document.getElementById(`match-${r.songId}`);
     if (!rowEl) return;
     rowEl.querySelectorAll('[data-select-track]').forEach(b => b.onclick = () => {
-      rowEl.dataset.decision = JSON.stringify({ action: 'select', track: JSON.parse(b.dataset.selectTrack) });
+      const candidate = candidateStore[b.dataset.candidateKey];
+      rowEl.dataset.decision = JSON.stringify({ action: 'select', track: candidate });
       rowEl.querySelectorAll('.song-row').forEach(sr => sr.style.outline = '');
       b.closest('.song-row').style.outline = `2px solid var(--violet)`;
     });
@@ -521,19 +687,20 @@ async function renderSpotifyStage(show) {
 function renderMatchRow(r) {
   const candidates = r.status === 'pending' ? (r.candidates || []) : [];
   const current = r.current;
+  const noMatchText = r.searchError ? `search failed: ${r.searchError}` : 'no match found';
   return `
     <div id="match-${r.songId}" style="margin-bottom:12px;">
       <div class="song-row">
         <img class="art" src="${(current && current.albumArtUrl) || (r.suggested && r.suggested.albumArtUrl) || ''}" />
         <div style="flex:1;min-width:0;">
           <div style="font-weight:500;">${r.title}</div>
-          <div class="muted">${r.artist} ${current ? `&middot; ${current.albumName || ''}` : r.suggested ? `&middot; ${r.suggested.albumName}` : '&middot; no match found'}</div>
+          <div class="muted">${r.artist} ${current ? `&middot; ${current.albumName || ''}` : r.suggested ? `&middot; ${r.suggested.albumName}` : `&middot; ${noMatchText}`}</div>
         </div>
         <span class="pill">search</span>
       </div>
       ${r.status === 'pending' ? `
         <div class="row" style="margin:6px 0 0 50px;">
-          ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-select-track='${JSON.stringify(c)}'>${c.albumName}</button>`).join('')}
+          ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-select-track>${c.albumName}</button>`).join('')}
           <button class="btn danger" data-exclude>Exclude</button>
           <button class="btn secondary" data-manual-search>Search Spotify</button>
           <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
@@ -569,11 +736,11 @@ async function openManualSpotifySearch(r, rowEl) {
             <div>${c.name}</div>
             <div class="muted">${c.artist} &middot; ${c.albumName} ${c.albumType === 'live' || /live/i.test(c.albumName) ? '(live)' : ''}</div>
           </div>
-          <button class="btn secondary" data-manual-pick='${JSON.stringify(c)}'>Use this</button>
+          <button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-manual-pick>Use this</button>
         </div>
       `).join('');
       resultsEl.querySelectorAll('[data-manual-pick]').forEach(btn => btn.onclick = () => {
-        const track = JSON.parse(btn.dataset.manualPick);
+        const track = candidateStore[btn.dataset.candidateKey];
         rowEl.dataset.decision = JSON.stringify({ action: 'select', track });
         resultsEl.innerHTML = `<p class="success">Selected: ${track.name} — ${track.albumName}</p>`;
       });
@@ -599,7 +766,11 @@ async function renderPlaylistStage(show) {
           `).join('')}
         </div>
       `).join('')}
-      <button class="btn" id="submit-playlists-btn">Add to playlists</button>
+      <div class="row" style="margin-top:14px;">
+        <button class="btn" id="submit-playlists-btn">Add to playlists</button>
+        <button class="btn secondary" id="skip-sync-btn">Save changes only, don't sync to Spotify</button>
+      </div>
+      <p class="muted" style="margin-top:6px;">The second option saves your dataset edits but leaves Spotify untouched — anything that ends up out of sync will show up under "Playlist updates needed" on the Sync page.</p>
       <div class="success" id="playlist-ok"></div>
       <div class="error" id="playlist-err"></div>
     </div>
@@ -611,13 +782,15 @@ async function renderPlaylistStage(show) {
     btn.closest('.song-row').style.opacity = '0.3';
     btn.disabled = true;
   });
-  document.getElementById('submit-playlists-btn').onclick = async () => {
+  async function submit(skipSync) {
     try {
-      const r = await api(`/api/shows/${show.id}/playlist-submit`, { method: 'POST', body: { drops: [...drops], swaps: {} } });
-      document.getElementById('playlist-ok').textContent = `Added ${r.added} songs. Show complete.`;
+      const r = await api(`/api/shows/${show.id}/playlist-submit`, { method: 'POST', body: { drops: [...drops], skipSync } });
+      document.getElementById('playlist-ok').textContent = skipSync ? 'Saved. Show complete — nothing was sent to Spotify.' : `Added ${r.added} songs. Show complete.`;
       setTimeout(exitWizard, 1200);
     } catch (e) { document.getElementById('playlist-err').textContent = e.message; }
-  };
+  }
+  document.getElementById('submit-playlists-btn').onclick = () => submit(false);
+  document.getElementById('skip-sync-btn').onclick = () => submit(true);
 }
 
 // ---------------- Reports (Dashboard subtabs) ----------------
@@ -822,16 +995,25 @@ async function renderSuperlatives() {
         ${data.bandsSeenMost.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.songCount}</td><td>${r.pctHeadline}%</td><td>${r.setlistVariationPct}%</td><td>${r.openCloseVariationPct}%</td></tr>`).join('')}
       </table>
     </div>
+    <div class="card">
+      <h2>Most songs played in a set</h2>
+      <table>
+        <tr><th>Date</th><th>Artist</th><th>Songs</th></tr>
+        ${data.mostSongsInSet.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.songCount}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
+      </table>
+    </div>
     <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
       <div class="card" style="flex:1;min-width:280px;">
-        <h2>Most unique songs by a repeat artist</h2>
+        <h2>Most new songs vs. the show before (repeat artists)</h2>
+        <p class="muted" style="margin-bottom:8px;">Compares each show to that same artist's immediately preceding show — the biggest jump in new songs from one time to the next.</p>
         <table>
-          <tr><th>Artist</th><th>Times seen</th><th>Unique songs</th></tr>
-          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.uniqueSongs}</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
+          <tr><th>Artist</th><th>Times seen</th><th>New songs in a set</th></tr>
+          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.newSongsInASet}</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
         </table>
       </div>
       <div class="card" style="flex:1;min-width:280px;">
         <h2>Most opener/closer variation</h2>
+        <p class="muted" style="margin-bottom:8px;">Limited to artists you've seen more than once.</p>
         <table>
           <tr><th>Artist</th><th>Times seen</th><th>Variation %</th></tr>
           ${data.mostOpenCloseVariation.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.openCloseVariationPct}%</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
