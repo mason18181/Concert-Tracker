@@ -72,7 +72,9 @@ async function initSchema() {
       id SERIAL PRIMARY KEY,
       show_id INT REFERENCES shows(id) ON DELETE CASCADE,
       artist TEXT NOT NULL,
-      billing_order INT
+      billing_order INT,
+      original_setlist JSONB,
+      setlist_source TEXT DEFAULT 'setlist.fm'
     );
 
     CREATE TABLE IF NOT EXISTS show_songs (
@@ -95,6 +97,11 @@ async function initSchema() {
       companion_id INT REFERENCES companions(id),
       PRIMARY KEY (show_id, companion_id)
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS original_setlist JSONB;
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlist_source TEXT DEFAULT 'setlist.fm';
   `);
 
   await dedupeSongs();
