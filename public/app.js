@@ -258,14 +258,8 @@ async function renderSync() {
       </div>
     </div>
     <div class="card">
-      <h2>Recheck Spotify for excluded songs</h2>
-      <p class="muted" style="margin-bottom:10px;">If a band releases an official version of a song after you saw it live, run this to see if it's findable now.</p>
-      <button class="btn secondary" id="recheck-btn">Recheck excluded songs</button>
-      <div id="recheck-results" style="margin-top:12px;"></div>
-    </div>
-    <div class="card">
       <h2>Spotify gaps check</h2>
-      <p class="muted" style="margin-bottom:10px;">Re-checks every song that's never made it into a playlist. Anything that turns out to already be in the right playlist gets marked as such automatically (your dataset was just out of date) — anything genuinely missing shows up below for you to approve.</p>
+      <p class="muted" style="margin-bottom:10px;">Ties every song in your dataset to a real Spotify track, including historical songs your spreadsheet marked as already added (those were never actually searched for until now). Anything that turns out to already be in the right playlist gets marked as such automatically — anything genuinely missing shows up below for you to approve. The first run will cover ~1,400 songs, so it can take several minutes; after that it's just the occasional new one.</p>
       <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
     </div>
@@ -293,7 +287,6 @@ async function renderSync() {
   app.querySelectorAll('[data-show]').forEach(btn => {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
-  document.getElementById('recheck-btn').onclick = () => runSpotifyRecheck();
   document.getElementById('gapcheck-btn').onclick = () => runGapCheck();
   wireAllShowsBrowser();
 }
@@ -340,33 +333,7 @@ async function runGapCheck() {
   } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
 }
 
-async function runSpotifyRecheck() {
-  const resultsEl = document.getElementById('recheck-results');
-  resultsEl.innerHTML = '<p class="muted">Searching Spotify for previously-excluded songs...</p>';
-  try {
-    const results = await api('/api/spotify/recheck-excluded');
-    if (!results.length) { resultsEl.innerHTML = '<p class="muted">No new matches found.</p>'; return; }
-    resultsEl.innerHTML = results.map(r => `
-      <div id="recheck-${r.songId}" style="margin-bottom:10px;">
-        <div class="muted" style="margin-bottom:4px;">${r.title} — ${r.artist}</div>
-        <div class="row">
-          ${r.candidates.map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-recheck-pick="${r.songId}">${c.albumName}</button>`).join('')}
-          <button class="btn danger" data-recheck-skip="${r.songId}">Still not it</button>
-        </div>
-      </div>
-    `).join('');
-    resultsEl.querySelectorAll('[data-recheck-pick]').forEach(btn => btn.onclick = async () => {
-      const songId = Number(btn.dataset.recheckPick);
-      const track = candidateStore[btn.dataset.candidateKey];
-      await api('/api/spotify/recheck-excluded/apply', { method: 'POST', body: { songId, track } });
-      document.getElementById(`recheck-${songId}`).innerHTML = '<p class="success">Matched — check "Playlist updates needed" above.</p>';
-      renderSync();
-    });
-    resultsEl.querySelectorAll('[data-recheck-skip]').forEach(btn => btn.onclick = () => {
-      document.getElementById(`recheck-${btn.dataset.recheckSkip}`).remove();
-    });
-  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
-}
+
 
 async function wireAllShowsBrowser() {
   const listEl = document.getElementById('all-shows-list');
@@ -390,14 +357,23 @@ async function wireAllShowsBrowser() {
 }
 
 // ---------------- Wizard: tag -> spotify review -> playlist submit ----------------
+let wizardOriginalStage = null;
+
 async function renderWizard() {
   const show = await api(`/api/shows/${wizardShowId}`);
+  if (wizardOriginalStage === null) wizardOriginalStage = show.stage;
   if (wizardStage === 'tag') return renderTagStage(show);
   if (wizardStage === 'spotify') return renderSpotifyStage(show);
   if (wizardStage === 'playlist') return renderPlaylistStage(show);
 }
 
-function exitWizard() { wizardShowId = null; wizardStage = null; activeTab = 'sync'; renderTab(); }
+function exitWizard() { wizardShowId = null; wizardStage = null; wizardOriginalStage = null; activeTab = 'sync'; renderTab(); }
+
+function toggleYesNoPill(p) {
+  const nowOn = !p.classList.contains('on');
+  p.classList.toggle('on', nowOn);
+  p.textContent = nowOn ? 'Yes' : 'No';
+}
 
 function refreshRowControls(table) {
   const rows = [...table.querySelectorAll('tr[data-song-row]')];
@@ -448,7 +424,7 @@ async function renderTagStage(show) {
   const companionIds = new Set(show.companions.map(c => c.id));
 
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
     <div class="card">
       <h2>Tag songs — ${new Date(show.date).toLocaleDateString()} · ${show.venue}</h2>
       ${show.artists.map(a => `
@@ -512,13 +488,14 @@ async function renderTagStage(show) {
 
   document.getElementById('back-btn').onclick = exitWizard;
   document.getElementById('cancel-review-btn').onclick = async () => {
-    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
+    if (!confirm(restoreMsg)) return;
     try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
       exitWizard();
     } catch (e) { showModal(e.message, { title: 'Error' }); }
   };
-  app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
+  app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => toggleYesNoPill(p));
   app.querySelectorAll('.pill[data-companion]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('[data-fillgap]').forEach(btn => btn.onclick = () => openFillGap(btn.dataset.fillgap, btn.dataset.artist));
 
@@ -546,7 +523,7 @@ async function renderTagStage(show) {
       `;
       table.appendChild(tr);
       refreshRowControls(table);
-      tr.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
+      tr.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => toggleYesNoPill(p));
       tr.querySelector('[data-remove-song]').onclick = async () => {
         if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
         try { await api(`/api/show-songs/${r.showSongId}/remove`, { method: 'POST' }); tr.remove(); refreshRowControls(table); }
@@ -640,7 +617,7 @@ async function openFillGap(showArtistId, artistName) {
 async function renderSpotifyStage(show) {
   const review = await api(`/api/shows/${show.id}/spotify-review`);
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
     <div class="card">
       <h2>Review Spotify matches</h2>
       ${review.map(r => renderMatchRow(r)).join('')}
@@ -650,9 +627,10 @@ async function renderSpotifyStage(show) {
   `;
   document.getElementById('back-btn').onclick = exitWizard;
   document.getElementById('cancel-review-btn').onclick = async () => {
-    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
+    if (!confirm(restoreMsg)) return;
     try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
       exitWizard();
     } catch (e) { showModal(e.message, { title: 'Error' }); }
   };
@@ -782,7 +760,7 @@ async function openManualSpotifySearch(r, rowEl) {
 async function renderPlaylistStage(show) {
   const preview = await api(`/api/shows/${show.id}/playlist-preview`);
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
     <div class="card">
       <h2>Ready to add to playlists</h2>
       ${preview.targets.map(t => `
@@ -808,9 +786,10 @@ async function renderPlaylistStage(show) {
   `;
   document.getElementById('back-btn').onclick = exitWizard;
   document.getElementById('cancel-review-btn').onclick = async () => {
-    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
+    if (!confirm(restoreMsg)) return;
     try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
       exitWizard();
     } catch (e) { showModal(e.message, { title: 'Error' }); }
   };
@@ -1112,15 +1091,13 @@ async function openSuperlativeDrilldown(type, artist, date) {
 async function renderJourney() {
   const data = await api(`/api/report/journey${companionsQuery()}`);
   dashBody().innerHTML = `
-    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
-      <div class="card" style="flex:1;min-width:300px;">
-        <h2>First 3 shows</h2>
-        ${data.first.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
-      </div>
-      <div class="card" style="flex:1;min-width:300px;">
-        <h2>Latest 3 shows</h2>
-        ${data.latest.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
-      </div>
+    <div class="card">
+      <h2>First 3 shows</h2>
+      ${data.first.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
+    </div>
+    <div class="card">
+      <h2>Latest 3 shows</h2>
+      ${data.latest.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
     </div>
   `;
 }
@@ -1130,7 +1107,7 @@ function journeyShowCard(sh) {
     <div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--line);">
       <div style="font-weight:600;">${new Date(sh.date).toLocaleDateString()} — ${sh.venue}</div>
       <div class="muted" style="margin-bottom:6px;">${[sh.city, sh.state].filter(Boolean).join(', ')}</div>
-      ${sh.artists.map(a => `<div class="muted">${a.orderLabel}: <span style="color:var(--text);">${a.artist}</span> — Opener: ${a.opener || '—'} · Closer: ${a.closer || '—'}</div>`).join('')}
+      ${sh.artists.map(a => `<div class="muted" style="white-space:nowrap;overflow-x:auto;">${a.orderLabel}: <span style="color:var(--text);">${a.artist}</span> — Opener: ${a.opener || '—'} · Closer: ${a.closer || '—'}</div>`).join('')}
     </div>
   `;
 }
