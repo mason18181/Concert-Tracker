@@ -186,14 +186,21 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 });
 
 app.get('/api/shows/pending', requireAuth, async (req, res) => {
-  const rows = (await pool.query(`SELECT * FROM shows WHERE stage != 'complete' ORDER BY date`)).rows;
+  const rows = (await pool.query(`
+    SELECT sh.*, (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner
+    FROM shows sh WHERE sh.stage != 'complete' ORDER BY sh.date
+  `)).rows;
   res.json(rows);
 });
 
 // Full show list (including completed ones) so a mistake can be corrected
 // after the fact — the wizard itself is safe to re-run on a complete show.
 app.get('/api/shows/all', requireAuth, async (req, res) => {
-  const rows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
+  const rows = (await pool.query(`
+    SELECT sh.id, sh.date, sh.venue, sh.city, sh.state, sh.stage,
+      (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner
+    FROM shows sh ORDER BY sh.date DESC
+  `)).rows;
   res.json(rows);
 });
 
@@ -306,20 +313,47 @@ app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
   }
 
   if (originAddress) {
-    const show = (await pool.query('SELECT venue_lat, venue_lng FROM shows WHERE id=$1', [showId])).rows[0];
-    let originCoord = null;
-    try { originCoord = await ors.geocode(originAddress); } catch (e) { /* leave distance blank if this fails */ }
-    let distance = null;
-    if (originCoord && show.venue_lat && show.venue_lng) {
-      try { distance = await ors.drivingDistance(originCoord, { lat: show.venue_lat, lng: show.venue_lng }); } catch (e) {}
+    const show = (await pool.query('SELECT origin_address, venue_lat, venue_lng, distance_miles, duration_minutes FROM shows WHERE id=$1', [showId])).rows[0];
+    const addressChanged = show.origin_address !== originAddress;
+    const dataMissing = show.distance_miles === null || show.duration_minutes === null;
+
+    if (!addressChanged && !dataMissing) {
+      // Nothing relevant changed — leave the existing (already-correct)
+      // travel data alone rather than re-running geocoding on every save.
+      await pool.query('UPDATE shows SET origin_address=$1 WHERE id=$2', [originAddress, showId]);
+    } else {
+      let originCoord = null;
+      let geocodeError = null;
+      try { originCoord = await ors.geocode(originAddress); } catch (e) { geocodeError = e.message; }
+      let distance = null;
+      if (originCoord && show.venue_lat && show.venue_lng) {
+        try { distance = await ors.drivingDistance(originCoord, { lat: show.venue_lat, lng: show.venue_lng }); } catch (e) { geocodeError = e.message; }
+      }
+      if (originCoord && distance) {
+        // A real result — safe to overwrite.
+        await pool.query(
+          `UPDATE shows SET origin_address=$1, origin_lat=$2, origin_lng=$3, distance_miles=$4, duration_minutes=$5 WHERE id=$6`,
+          [originAddress, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, showId]
+        );
+      } else {
+        // Geocoding failed this time — update the address text so it's not
+        // lost, but never blank out previously-good distance/duration with
+        // a failed attempt's null result.
+        await pool.query('UPDATE shows SET origin_address=$1 WHERE id=$2', [originAddress, showId]);
+      }
     }
-    await pool.query(
-      `UPDATE shows SET origin_address=$1, origin_lat=$2, origin_lng=$3, distance_miles=$4, duration_minutes=$5 WHERE id=$6`,
-      [originAddress, originCoord ? originCoord.lat : null, originCoord ? originCoord.lng : null, distance ? distance.miles : null, distance ? distance.minutes : null, showId]
-    );
   }
 
   await pool.query(`UPDATE shows SET stage='tagged' WHERE id=$1`, [showId]);
+  res.json({ ok: true });
+});
+
+// Backs a show's review out to "not started" — used when someone wants to
+// abandon progress on a show rather than push through to completion. Leaves
+// whatever flags/matches were already saved in place (harmless, re-editable
+// next time) — this only resets which step it's parked on.
+app.post('/api/shows/:id/reset-stage', requireAuth, async (req, res) => {
+  await pool.query(`UPDATE shows SET stage='new' WHERE id=$1`, [Number(req.params.id)]);
   res.json({ ok: true });
 });
 
@@ -522,36 +556,6 @@ app.post('/api/shows/:id/playlist-submit', requireAuth, async (req, res) => {
 
   await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
   res.json({ ok: true, added });
-});
-
-// A show needs a playlist push (without redoing tagging/review) whenever it
-// has a song that's matched on Spotify but hasn't made it into a playlist
-// that show actually belongs in — scoped per-show to only the playlists
-// that show's own companions make applicable (a show with no Wes/Jeff
-// companion never "needs" the Wes/Dad flags, since those simply don't apply
-// to it and are never expected to be true).
-app.get('/api/shows/needs-playlist-update', requireAuth, async (req, res) => {
-  const rows = (await pool.query(`
-    SELECT DISTINCT sh.id, sh.date, sh.venue
-    FROM shows sh
-    JOIN show_artists sa ON sa.show_id = sh.id
-    JOIN show_songs ss ON ss.show_artist_id = sa.id
-    JOIN songs s ON s.id = ss.song_id
-    WHERE s.spotify_status IN ('matched','assumed_added')
-      AND (
-        (NOT ss.added_to_seen)
-        OR (NOT ss.added_to_wes AND EXISTS (
-          SELECT 1 FROM show_companions sc JOIN companions c ON c.id=sc.companion_id
-          WHERE sc.show_id=sh.id AND c.name='Wes'
-        ))
-        OR (NOT ss.added_to_dad AND EXISTS (
-          SELECT 1 FROM show_companions sc JOIN companions c ON c.id=sc.companion_id
-          WHERE sc.show_id=sh.id AND c.name='Jeff'
-        ))
-      )
-    ORDER BY sh.date DESC
-  `)).rows;
-  res.json(rows);
 });
 
 // Re-searches Spotify for every song currently marked "excluded" — for when
@@ -767,7 +771,7 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
     SELECT sa.artist, sa.show_id,
       (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
       (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer,
-      (sa.billing_order = 1 OR sa.billing_order IS NULL) AS is_headliner_appearance
+      (sa.billing_order = 1) AS is_headliner_appearance
     FROM show_artists sa
     JOIN show_songs ss ON ss.show_artist_id = sa.id
     JOIN songs s ON s.id = ss.song_id
@@ -851,6 +855,79 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
   res.json({ bandsSeenMost, mostUniqueSongsRepeat, mostOpenCloseVariation, mostSongsInSet });
 });
 
+// Drilldown detail behind each superlatives row.
+app.get('/api/superlatives/drilldown/bands-seen/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT sh.date, sh.venue, sh.city, sh.state, count(ss.id) AS song_count
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state ORDER BY sh.date
+  `, [req.params.artist])).rows;
+  res.json(rows);
+});
+
+app.get('/api/superlatives/drilldown/set/:date/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT s.title, ss.play_order, ss.status, ss.known
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sh.date=$1 AND sa.artist=$2 ORDER BY ss.play_order
+  `, [req.params.date, req.params.artist])).rows;
+  res.json(rows);
+});
+
+app.get('/api/superlatives/drilldown/open-close/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT sh.date, sh.venue,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue ORDER BY sh.date
+  `, [req.params.artist])).rows;
+  res.json(rows);
+});
+
+// The side-by-side comparison: finds the specific consecutive pair of shows
+// that produced this artist's "most new songs" number, and returns both
+// setlists lined up — overlapping songs first (matched row to row), then
+// each show's songs that didn't appear in the other.
+app.get('/api/superlatives/drilldown/repeat-compare/:artist', requireAuth, async (req, res) => {
+  const artist = req.params.artist;
+  const shows = (await pool.query(`
+    SELECT sh.id, sh.date, sh.venue, array_agg(DISTINCT ss.song_id) AS song_ids
+    FROM show_artists sa JOIN shows sh ON sh.id=sa.show_id JOIN show_songs ss ON ss.show_artist_id=sa.id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue ORDER BY sh.date
+  `, [artist])).rows;
+
+  let best = null;
+  for (let i = 1; i < shows.length; i++) {
+    const prevSet = new Set(shows[i - 1].song_ids.map(Number));
+    const newCount = shows[i].song_ids.map(Number).filter(id => !prevSet.has(id)).length;
+    if (!best || newCount > best.newCount) best = { prev: shows[i - 1], curr: shows[i], newCount };
+  }
+  if (!best) return res.json(null);
+
+  async function songsFor(showId) {
+    return (await pool.query(`
+      SELECT s.title, s.id AS song_id, ss.play_order
+      FROM show_artists sa JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+      WHERE sa.show_id=$1 AND sa.artist=$2 ORDER BY ss.play_order
+    `, [showId, artist])).rows;
+  }
+  const prevSongs = await songsFor(best.prev.id);
+  const currSongs = await songsFor(best.curr.id);
+  const prevIds = new Set(prevSongs.map(s => s.song_id));
+  const currIds = new Set(currSongs.map(s => s.song_id));
+
+  const overlap = currSongs.filter(s => prevIds.has(s.song_id)).map(s => s.title);
+  const prevOnly = prevSongs.filter(s => !currIds.has(s.song_id)).map(s => s.title);
+  const currOnly = currSongs.filter(s => !prevIds.has(s.song_id)).map(s => s.title);
+
+  res.json({
+    prevShow: { date: best.prev.date, venue: best.prev.venue },
+    currShow: { date: best.curr.date, venue: best.curr.venue },
+    overlap, prevOnly, currOnly,
+  });
+});
+
 app.get('/api/report/journey', requireAuth, async (req, res) => {
   const cIds = companionIdsParam(req);
   const filterClause = `($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))`;
@@ -885,8 +962,10 @@ app.get('/api/report/unknowns', requireAuth, async (req, res) => {
   `, [cIds])).rows[0];
 
   const songs = (await pool.query(`
-    SELECT s.artist, s.title, bool_or(${REGRET_SQL}) AS regret
-    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id=ss.song_id
+    SELECT s.artist, s.title, bool_or(${REGRET_SQL}) AS regret,
+      (array_agg(sh.date ORDER BY sh.date ASC))[1] AS date,
+      (array_agg(sh.venue ORDER BY sh.date ASC))[1] AS venue
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id=ss.song_id JOIN shows sh ON sh.id = sa.show_id
     WHERE NOT ss.known AND ${filterClause}
       AND NOT EXISTS (SELECT 1 FROM show_songs ss2 WHERE ss2.song_id = ss.song_id AND ss2.known = true)
     GROUP BY s.id, s.artist, s.title
@@ -1056,10 +1135,16 @@ app.post('/api/admin/backfill-travel', requireAuth, async (req, res) => {
       let venueCoord = (sh.venue_lat && sh.venue_lng) ? { lat: sh.venue_lat, lng: sh.venue_lng } : null;
       if (!venueCoord) {
         venueCoord = await ors.geocode(`${sh.venue}, ${sh.city}, ${sh.state || ''}`);
+        if (!venueCoord) {
+          // The specific venue name wasn't found — fall back to the city
+          // itself so travel distance is at least approximately right,
+          // rather than leaving it blank entirely.
+          venueCoord = await ors.geocode(`${sh.city}, ${sh.state || ''}`);
+        }
         if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, sh.id]);
       }
       if (!venueCoord) {
-        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find "${sh.venue}, ${sh.city || ''}".` });
+        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find "${sh.venue}" or even the city "${sh.city}, ${sh.state || ''}".` });
         continue;
       }
       const originCoord = await ors.geocode(originAddress);
