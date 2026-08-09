@@ -76,10 +76,27 @@ function scoreCandidate(track, queryTitleNormalized) {
   return score;
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Spotify's API expects well-behaved clients to back off and retry when
+// rate-limited, using the Retry-After header it sends back — failing
+// immediately on a 429 (which is what happened before) means one burst of
+// requests (e.g. paginating a large playlist) can permanently block an
+// entire run instead of just pausing briefly.
+async function fetchSpotify(url, options, attempt = 1) {
+  const res = await fetch(url, options);
+  if (res.status === 429 && attempt <= 4) {
+    const retryAfter = Number(res.headers.get('Retry-After')) || 2;
+    await sleep((retryAfter + 1) * 1000);
+    return fetchSpotify(url, options, attempt + 1);
+  }
+  return res;
+}
+
 async function searchTrack(title, artist) {
   const token = await getAccessToken();
   const q = artist ? `track:"${title}" artist:"${artist}"` : `track:"${title}"`;
-  const res = await fetch(`${API_BASE}/search?type=track&limit=10&q=${encodeURIComponent(q)}`, {
+  const res = await fetchSpotify(`${API_BASE}/search?type=track&limit=10&q=${encodeURIComponent(q)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error(`Spotify search failed: ${await res.text()}`);
@@ -107,7 +124,7 @@ async function addTracksToPlaylist(playlistId, trackUris) {
   // Spotify caps adds at 100 URIs per call.
   for (let i = 0; i < trackUris.length; i += 100) {
     const batch = trackUris.slice(i, i + 100);
-    const res = await fetch(`${API_BASE}/playlists/${playlistId}/tracks`, {
+    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/tracks`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ uris: batch }),
@@ -122,13 +139,14 @@ async function getPlaylistTrackIds(playlistId) {
   const ids = new Set();
   let url = `${API_BASE}/playlists/${playlistId}/tracks?fields=next,items(track(id))&limit=100`;
   while (url) {
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetchSpotify(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) throw new Error(`Spotify playlist read failed: ${await res.text()}`);
     const data = await res.json();
     for (const item of data.items || []) {
       if (item.track && item.track.id) ids.add(item.track.id);
     }
     url = data.next;
+    if (url) await sleep(80); // small pacing between pages of a large playlist
   }
   return ids;
 }
@@ -138,7 +156,7 @@ async function removeTracksFromPlaylist(playlistId, trackUris) {
   const token = await getAccessToken();
   for (let i = 0; i < trackUris.length; i += 100) {
     const batch = trackUris.slice(i, i + 100);
-    const res = await fetch(`${API_BASE}/playlists/${playlistId}/tracks`, {
+    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/tracks`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ tracks: batch.map(uri => ({ uri })) }),
