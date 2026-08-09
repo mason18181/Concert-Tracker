@@ -251,15 +251,15 @@ app.get('/api/shows/pending', requireAuth, async (req, res) => {
 // Full show list (including completed ones) so a mistake can be corrected
 // after the fact — the wizard itself is safe to re-run on a complete show.
 app.get('/api/shows/all', requireAuth, async (req, res) => {
-  const rows = (await pool.query(`
-    SELECT sh.id, sh.date, sh.venue, sh.city, sh.state, sh.stage,
-      (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner,
-      (SELECT sa.id FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner_show_artist_id,
-      (SELECT sa.setlistfm_url FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_url,
-      (SELECT sa.setlistfm_id FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_id
-    FROM shows sh ORDER BY sh.date DESC
-  `)).rows;
-  res.json(rows);
+  const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
+  for (const sh of shows) {
+    sh.artists = (await pool.query(
+      `SELECT id, artist, billing_order, setlistfm_url, setlistfm_id FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id`,
+      [sh.id]
+    )).rows;
+    sh.headliner = sh.artists[0] ? sh.artists[0].artist : null;
+  }
+  res.json(shows);
 });
 
 app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
