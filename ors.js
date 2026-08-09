@@ -33,13 +33,22 @@ async function drivingDistance(origin, dest) {
   };
 }
 
-// Tries the specific venue first; if that's not found (common for smaller
-// venues with spotty map-data coverage), falls back to the city itself so
-// travel distance is at least approximately right instead of blank.
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Tries the specific venue first; if that's not found — or the call itself
+// fails, e.g. a rate limit during a bulk import — falls back to the city
+// itself so travel distance is at least approximately right instead of
+// blank. The earlier version only handled "no results," not "the call
+// threw," so a single rate-limited request could skip the fallback
+// entirely — this catches both.
 async function geocodeVenue(venue, city, state) {
-  let coord = await geocode(`${venue}, ${city || ''}, ${state || ''}`);
-  if (!coord && city) coord = await geocode(`${city}, ${state || ''}`);
+  let coord = null;
+  try { coord = await geocode(`${venue}, ${city || ''}, ${state || ''}`); } catch (e) { coord = null; }
+  if (!coord && city) {
+    await sleep(250);
+    try { coord = await geocode(`${city}, ${state || ''}`); } catch (e) { coord = null; }
+  }
   return coord;
 }
 
-module.exports = { geocode, drivingDistance, geocodeVenue };
+module.exports = { geocode, drivingDistance, geocodeVenue, sleep };
