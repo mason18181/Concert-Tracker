@@ -18,6 +18,10 @@ function stashCandidate(candidate) {
   candidateStore[key] = candidate;
   return key;
 }
+function fmt(n) {
+  if (n === null || n === undefined) return '0';
+  return Number(n).toLocaleString('en-US');
+}
 
 const DASHBOARD_SUBTABS = [
   ['overview', 'Overview'],
@@ -201,7 +205,7 @@ async function renderSettings() {
     <div class="success" id="settings-ok"></div>
     <div class="card" style="margin-top:20px;">
       <h2>Historical import</h2>
-      <p class="muted">One-time: loads your 59 historical shows into the database. Safe to click more than once — already-imported shows are skipped.</p>
+      <p class="muted">Loads your 59 historical shows into the database. Safe to click more than once — already-imported shows are skipped for songs/companions, but this also retries travel geocoding for any of them still missing miles/time, so it doubles as the fix for a straggler like a venue that failed to geocode the first time.</p>
       <button class="btn secondary" id="import-btn">Run historical import</button>
       <div class="muted" id="import-status" style="margin-top:8px;"></div>
     </div>
@@ -213,10 +217,10 @@ async function renderSettings() {
   `;
   document.getElementById('import-btn').onclick = async () => {
     const statusEl = document.getElementById('import-status');
-    statusEl.textContent = 'Importing — this can take a minute or two...';
+    statusEl.textContent = 'Running — this can take a minute or two...';
     try {
       const r = await api('/api/import/historical', { method: 'POST' });
-      statusEl.textContent = `Imported ${r.imported} shows (${r.skipped} already existed).`;
+      statusEl.textContent = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in.`;
     } catch (e) { statusEl.textContent = e.message; }
   };
   document.getElementById('spotify-connect-btn').onclick = async () => {
@@ -293,44 +297,55 @@ async function renderSync() {
 
 async function runGapCheck() {
   const resultsEl = document.getElementById('gapcheck-results');
-  resultsEl.innerHTML = '<p class="muted">Checking gap songs against your actual playlists — this can take a minute...</p>';
+  resultsEl.innerHTML = '<p class="muted">Starting...</p>';
+  let offset = 0;
+  let totalAutoMarked = 0;
+  let allAdditions = [];
   try {
-    const r = await api('/api/spotify/gap-check');
-    const parts = [];
-    if (r.autoMarked) parts.push(`<p class="success">${r.autoMarked} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
-    if (!r.needsAddition.length) {
-      if (!r.autoMarked) parts.push('<p class="muted">Nothing missing.</p>');
-      resultsEl.innerHTML = parts.join('');
-      return;
+    while (true) {
+      const r = await api(`/api/spotify/gap-check?offset=${offset}`);
+      totalAutoMarked += r.autoMarked;
+      allAdditions = allAdditions.concat(r.needsAddition);
+      offset = r.processed;
+      resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
+      if (r.done) break;
     }
-    parts.push(`<div id="gap-additions">${r.needsAddition.map(a => `
-      <div class="song-row" data-gap-song="${a.songId}">
-        <img class="art" src="${a.track.albumArtUrl || ''}" />
-        <div style="flex:1;min-width:0;">
-          <div>${a.title} — ${a.artist}</div>
-          <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
-        </div>
-        <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
-      </div>
-    `).join('')}</div>
-    <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${r.needsAddition.length} song(s) to playlists</button>`);
-    resultsEl.innerHTML = parts.join('');
+  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; return; }
 
-    const skipped = new Set();
-    resultsEl.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
-      skipped.add(Number(btn.dataset.gapDrop));
-      btn.closest('.song-row').style.opacity = '0.3';
-      btn.disabled = true;
-    });
-    document.getElementById('apply-gap-additions-btn').onclick = async () => {
-      const additions = r.needsAddition.filter(a => !skipped.has(a.songId));
-      try {
-        const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions } });
-        resultsEl.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
-        renderSync();
-      } catch (e) { showModal(e.message, { title: 'Error' }); }
-    };
-  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
+  const parts = [];
+  if (totalAutoMarked) parts.push(`<p class="success">${fmt(totalAutoMarked)} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
+  if (!allAdditions.length) {
+    if (!totalAutoMarked) parts.push('<p class="muted">Nothing missing.</p>');
+    resultsEl.innerHTML = parts.join('');
+    return;
+  }
+  parts.push(`<div id="gap-additions">${allAdditions.map(a => `
+    <div class="song-row" data-gap-song="${a.songId}">
+      <img class="art" src="${a.track.albumArtUrl || ''}" />
+      <div style="flex:1;min-width:0;">
+        <div>${a.title} — ${a.artist}</div>
+        <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
+      </div>
+      <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
+    </div>
+  `).join('')}</div>
+  <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(allAdditions.length)} song(s) to playlists</button>`);
+  resultsEl.innerHTML = parts.join('');
+
+  const skipped = new Set();
+  resultsEl.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
+    skipped.add(Number(btn.dataset.gapDrop));
+    btn.closest('.song-row').style.opacity = '0.3';
+    btn.disabled = true;
+  });
+  document.getElementById('apply-gap-additions-btn').onclick = async () => {
+    const additions = allAdditions.filter(a => !skipped.has(a.songId));
+    try {
+      const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions } });
+      resultsEl.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
+      renderSync();
+    } catch (e) { showModal(e.message, { title: 'Error' }); }
+  };
 }
 
 
@@ -389,34 +404,33 @@ async function persistOrder(table) {
   try { await api(`/api/show-artists/${artistId}/reorder`, { method: 'POST', body: { orderedShowSongIds } }); }
   catch (e) { showModal(e.message, { title: 'Error' }); }
 }
-// Delegated on #app (which never gets replaced, only its contents do) so
-// this works for every render without re-wiring, including rows added
-// dynamically after the fact.
-app.addEventListener('click', e => {
-  const upBtn = e.target.closest('[data-move-up]');
-  if (upBtn && !upBtn.disabled) {
-    const table = upBtn.closest('table[data-artist-table]');
-    const tr = upBtn.closest('tr');
-    const prev = tr && tr.previousElementSibling;
-    if (table && prev && prev.dataset.songRow) {
-      table.insertBefore(tr, prev);
-      refreshRowControls(table);
-      persistOrder(table);
-    }
-    return;
+// Plain global functions invoked via each button's own inline onclick
+// attribute — deliberately not relying on any addEventListener wiring step
+// or event-delegation/closest() timing, so there's nothing that can go
+// stale or fail to attach. window.moveSongUp/Down exist the instant the
+// script loads, and the button's onclick="" references them directly.
+window.moveSongUp = function (id) {
+  const tr = document.querySelector(`tr[data-song-row="${id}"]`);
+  if (!tr) return;
+  const table = tr.closest('table[data-artist-table]');
+  const prev = tr.previousElementSibling;
+  if (table && prev && prev.dataset && prev.dataset.songRow) {
+    table.insertBefore(tr, prev);
+    refreshRowControls(table);
+    persistOrder(table);
   }
-  const downBtn = e.target.closest('[data-move-down]');
-  if (downBtn && !downBtn.disabled) {
-    const table = downBtn.closest('table[data-artist-table]');
-    const tr = downBtn.closest('tr');
-    const next = tr && tr.nextElementSibling;
-    if (table && next && next.dataset.songRow) {
-      table.insertBefore(next, tr);
-      refreshRowControls(table);
-      persistOrder(table);
-    }
+};
+window.moveSongDown = function (id) {
+  const tr = document.querySelector(`tr[data-song-row="${id}"]`);
+  if (!tr) return;
+  const table = tr.closest('table[data-artist-table]');
+  const next = tr.nextElementSibling;
+  if (table && next && next.dataset && next.dataset.songRow) {
+    table.insertBefore(next, tr);
+    refreshRowControls(table);
+    persistOrder(table);
   }
-});
+};
 
 async function renderTagStage(show) {
   const companions = await api('/api/companions');
@@ -449,8 +463,8 @@ async function renderTagStage(show) {
             ${a.songs.map((s, i) => `
               <tr data-song-row="${s.id}">
                 <td style="white-space:nowrap;">
-                  <button class="btn secondary" data-move-up="${s.id}" data-artist-id="${a.id}" style="padding:2px 6px;font-size:11px;" ${i === 0 ? 'disabled' : ''}>&uarr;</button>
-                  <button class="btn secondary" data-move-down="${s.id}" data-artist-id="${a.id}" style="padding:2px 6px;font-size:11px;" ${i === a.songs.length - 1 ? 'disabled' : ''}>&darr;</button>
+                  <button class="btn secondary" data-move-up onclick="moveSongUp(${s.id})" style="padding:2px 6px;font-size:11px;" ${i === 0 ? 'disabled' : ''}>&uarr;</button>
+                  <button class="btn secondary" data-move-down onclick="moveSongDown(${s.id})" style="padding:2px 6px;font-size:11px;" ${i === a.songs.length - 1 ? 'disabled' : ''}>&darr;</button>
                   <span class="order-num">${s.play_order}</span>
                 </td>
                 <td>${s.title}</td>
@@ -511,8 +525,8 @@ async function renderTagStage(show) {
       tr.dataset.songRow = r.showSongId;
       tr.innerHTML = `
         <td style="white-space:nowrap;">
-          <button class="btn secondary" data-move-up style="padding:2px 6px;font-size:11px;">&uarr;</button>
-          <button class="btn secondary" data-move-down style="padding:2px 6px;font-size:11px;" disabled>&darr;</button>
+          <button class="btn secondary" data-move-up onclick="moveSongUp(${r.showSongId})" style="padding:2px 6px;font-size:11px;">&uarr;</button>
+          <button class="btn secondary" data-move-down onclick="moveSongDown(${r.showSongId})" style="padding:2px 6px;font-size:11px;" disabled>&darr;</button>
           <span class="order-num">${r.playOrder}</span>
         </td>
         <td>${r.title}</td><td></td>
@@ -860,9 +874,9 @@ async function renderOverview() {
     <div class="card">
       <h2>Overview</h2>
       <div class="stat-grid" style="margin-bottom:20px;">
-        <div class="stat-tile"><div class="num">${t.shows}</div><div class="label">Shows</div></div>
-        <div class="stat-tile"><div class="num">${t.unique_artists}</div><div class="label">Unique Artists</div></div>
-        <div class="stat-tile"><div class="num">${t.unique_songs}</div><div class="label">Unique songs</div></div>
+        <div class="stat-tile"><div class="num">${fmt(t.shows)}</div><div class="label">Shows</div></div>
+        <div class="stat-tile"><div class="num">${fmt(t.unique_artists)}</div><div class="label">Unique Artists</div></div>
+        <div class="stat-tile"><div class="num">${fmt(t.unique_songs)}</div><div class="label">Unique songs</div></div>
         <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
       </div>
       <div class="row" style="margin-bottom:12px;">
@@ -968,11 +982,9 @@ async function renderTravel() {
     <div class="card">
       <h2>Travel</h2>
       <div class="stat-grid" style="margin-bottom:16px;">
-        <div class="stat-tile"><div class="num">${Math.round(data.totals.miles || 0)}</div><div class="label">Total miles</div></div>
-        <div class="stat-tile"><div class="num">${hours}</div><div class="label">Total travel time (hrs)</div></div>
+        <div class="stat-tile"><div class="num">${fmt(Math.round(data.totals.miles || 0))}</div><div class="label">Total miles</div></div>
+        <div class="stat-tile"><div class="num">${fmt(hours)}</div><div class="label">Total travel time (hrs)</div></div>
       </div>
-      <button class="btn secondary" id="backfill-btn">Backfill missing travel data</button>
-      <div class="muted" id="backfill-status" style="margin-top:8px;"></div>
     </div>
     <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
       <div class="card" style="flex:1;min-width:280px;">
@@ -986,20 +998,11 @@ async function renderTravel() {
         <h2>Travel shows</h2>
         <table>
           <tr><th>Venue</th><th>City</th><th>State</th><th>Miles</th><th>Travel time</th><th>Bands</th></tr>
-          ${data.travel.map(s => `<tr><td>${s.venue}</td><td>${s.city || '—'}</td><td>${s.state || '—'}</td><td>${s.distance_miles ?? '—'}</td><td>${s.duration_minutes != null ? (Math.round((s.duration_minutes / 60) * 10) / 10) + ' hrs' : '—'}</td><td>${s.bands || '—'}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
+          ${data.travel.map(s => `<tr><td>${s.venue}</td><td>${s.city || '—'}</td><td>${s.state || '—'}</td><td>${s.distance_miles != null ? fmt(s.distance_miles) : '—'}</td><td>${s.duration_minutes != null ? (Math.round((s.duration_minutes / 60) * 10) / 10) + ' hrs' : '—'}</td><td>${s.bands || '—'}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
         </table>
       </div>
     </div>
   `;
-  document.getElementById('backfill-btn').onclick = async () => {
-    const statusEl = document.getElementById('backfill-status');
-    statusEl.textContent = 'Retrying geocoding for shows missing travel data...';
-    try {
-      const r = await api('/api/admin/backfill-travel', { method: 'POST' });
-      statusEl.innerHTML = `Fixed ${r.fixed} of ${r.checked} shows.` + (r.failures.length ? `<div style="margin-top:8px;">${r.failures.map(f => `<div class="error">${f.venue}: ${f.reason}</div>`).join('')}</div>` : '');
-      renderTravel();
-    } catch (e) { statusEl.textContent = e.message; }
-  };
 }
 
 async function renderSuperlatives() {
@@ -1062,10 +1065,10 @@ async function openSuperlativeDrilldown(type, artist, date) {
   try {
     if (type === 'bands-seen') {
       const rows = await api(`/api/superlatives/drilldown/bands-seen/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td></tr>`).join('')}</table>`);
+      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td></tr>`).join('')}</table>`);
     } else if (type === 'set') {
       const rows = await api(`/api/superlatives/drilldown/set/${date}/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Status</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.status || 'seen'}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
+      openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
     } else if (type === 'open-close') {
       const rows = await api(`/api/superlatives/drilldown/open-close/${encodeURIComponent(artist)}`);
       openDrilldownModal(`${artist} — openers &amp; closers`, `<table><tr><th>Date</th><th>Venue</th><th>Opener</th><th>Closer</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}</td><td>${r.opener}</td><td>${r.closer}</td></tr>`).join('')}</table>`);
@@ -1122,7 +1125,7 @@ async function renderUnknowns() {
         <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
         <div class="stat-tile"><div class="num">${t.pct_missed || 0}%</div><div class="label">Missed</div></div>
         <div class="stat-tile"><div class="num">${t.pct_skipped || 0}%</div><div class="label">Skipped</div></div>
-        <div class="stat-tile"><div class="num">${t.regret_count || 0}</div><div class="label">Regret</div></div>
+        <div class="stat-tile"><div class="num">${fmt(t.regret_count || 0)}</div><div class="label">Regret</div></div>
       </div>
       <table>
         <tr><th>Date</th><th>Venue</th><th>Artist</th><th>Song</th><th>Regret</th></tr>
