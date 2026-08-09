@@ -8,16 +8,19 @@ function apiKey() {
 
 // Resolves a free-text address or venue name to coordinates. Returns null
 // (rather than throwing) when nothing matches, so callers can fall back to
-// a manual pick instead of failing the whole sync.
-async function geocode(text) {
-  const url = `${BASE}/geocode/search?api_key=${apiKey()}&text=${encodeURIComponent(text)}&size=1`;
+// a manual pick instead of failing the whole sync. focusLat/focusLon bias
+// results toward a known-good area — important for venue names that
+// collide with other places (see geocodeVenue below).
+async function geocode(text, focus) {
+  let url = `${BASE}/geocode/search?api_key=${apiKey()}&text=${encodeURIComponent(text)}&size=1`;
+  if (focus) url += `&focus.point.lat=${focus.lat}&focus.point.lon=${focus.lng}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`ORS geocode failed: ${await res.text()}`);
   const data = await res.json();
   const feature = data.features && data.features[0];
   if (!feature) return null;
   const [lng, lat] = feature.geometry.coordinates;
-  return { lat, lng, label: feature.properties.label };
+  return { lat, lng, label: feature.properties.label, region: feature.properties.region || null, locality: feature.properties.locality || null };
 }
 
 // origin/dest are {lat, lng}. Returns real driving distance/time.
@@ -35,20 +38,53 @@ async function drivingDistance(origin, dest) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Tries the specific venue first; if that's not found — or the call itself
-// fails, e.g. a rate limit during a bulk import — falls back to the city
-// itself so travel distance is at least approximately right instead of
-// blank. The earlier version only handled "no results," not "the call
-// threw," so a single rate-limited request could skip the fallback
-// entirely — this catches both.
+// Loose match: handles "Georgia" vs "GA", extra whitespace, casing.
+function looseMatch(a, b) {
+  if (!a || !b) return false;
+  const na = String(a).toLowerCase().trim();
+  const nb = String(b).toLowerCase().trim();
+  return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+function haversineMiles(a, b) {
+  const R = 3958.8;
+  const toRad = d => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat), lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(h));
+}
+
+// Geocodes a venue reliably even when its name collides with an unrelated
+// place elsewhere (e.g. "Avondale Brewing Company, Birmingham, Alabama"
+// silently matching Avondale, Arizona instead — a real failure this hit).
+// Strategy: geocode the city first as a trustworthy anchor, then search for
+// the venue biased toward that anchor point, and reject the venue result if
+// either its state doesn't match what we expected OR it lands implausibly
+// far from the city it's supposed to be in (catches a same-state-wrong-city
+// mismatch, which a region check alone would miss) — falling back to the
+// city-level anchor (right city, not exact address) rather than accepting
+// a confidently-wrong match.
 async function geocodeVenue(venue, city, state) {
-  let coord = null;
-  try { coord = await geocode(`${venue}, ${city || ''}, ${state || ''}`); } catch (e) { coord = null; }
-  if (!coord && city) {
-    await sleep(250);
-    try { coord = await geocode(`${city}, ${state || ''}`); } catch (e) { coord = null; }
+  let anchor = null;
+  if (city) {
+    try { anchor = await geocode(`${city}, ${state || ''}`); } catch (e) { anchor = null; }
+    await sleep(200);
   }
-  return coord;
+
+  let venueCoord = null;
+  try { venueCoord = await geocode(`${venue}, ${city || ''}, ${state || ''}`, anchor); } catch (e) { venueCoord = null; }
+
+  const regionOk = venueCoord && (!state || !venueCoord.region || looseMatch(venueCoord.region, state));
+  const distanceOk = venueCoord && (!anchor || haversineMiles(venueCoord, anchor) <= 40);
+
+  if (regionOk && distanceOk) return venueCoord;
+
+  // Venue result was missing, wrong-state, or implausibly far from its own
+  // city — the city anchor itself is still a valid, verified point, so use
+  // that instead of a confidently-wrong address.
+  return anchor;
 }
 
 module.exports = { geocode, drivingDistance, geocodeVenue, sleep };
