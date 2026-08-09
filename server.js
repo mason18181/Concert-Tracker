@@ -69,11 +69,49 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
     let imported = 0, skipped = 0, geoFilled = 0;
     const geoFailures = [];
     const venueCoordCache = {};
+    let artistsAdded = 0;
+
+    async function insertArtistBlock(showId, artistBlock) {
+      const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
+      const artistRow = (await pool.query(
+        'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+        [showId, artistBlock.artist, artistBlock.billing_order, JSON.stringify(originalTitles), 'spreadsheet import']
+      )).rows[0];
+      for (const s of artistBlock.songs) {
+        const song = await findOrCreateSong(artistBlock.artist, s.song);
+        if (s.already_on_spotify && song.spotify_status === 'pending') {
+          await pool.query(`UPDATE songs SET spotify_status='assumed_added' WHERE id=$1`, [song.id]);
+        }
+        await pool.query(
+          `INSERT INTO show_songs (show_artist_id, song_id, play_order, known, liked_now, status, already_on_spotify, added_to_seen)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [artistRow.id, song.id, s.play_order, s.known, s.liked_now, s.status, s.already_on_spotify, s.already_on_spotify]
+        );
+      }
+    }
 
     for (const show of shows) {
       const already = (await pool.query('SELECT id, distance_miles, duration_minutes FROM shows WHERE date=$1 AND venue=$2', [show.date, show.venue])).rows[0];
       if (already) {
         skipped++;
+
+        // Reconcile artists on an already-imported show: add any artist in
+        // the seed that isn't in the database yet (e.g. a headliner you
+        // skipped and didn't originally log), and fix billing order for
+        // existing artists if the seed's order shifted to make room.
+        const existingArtists = (await pool.query('SELECT id, artist, billing_order FROM show_artists WHERE show_id=$1', [already.id])).rows;
+        const existingByName = {};
+        existingArtists.forEach(a => { existingByName[a.artist] = a; });
+        for (const artistBlock of show.artists) {
+          const existing = existingByName[artistBlock.artist];
+          if (!existing) {
+            await insertArtistBlock(already.id, artistBlock);
+            artistsAdded++;
+          } else if (existing.billing_order !== artistBlock.billing_order) {
+            await pool.query('UPDATE show_artists SET billing_order=$1 WHERE id=$2', [artistBlock.billing_order, existing.id]);
+          }
+        }
+
         // Already imported, but if it's still missing travel data (e.g. a
         // past geocoding failure), retry just that part — don't touch its
         // songs/companions again, just fill in what's missing.
@@ -140,26 +178,11 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
 
       for (const artistBlock of show.artists) {
-        const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
-        const artistRow = (await pool.query(
-          'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-          [showRow.id, artistBlock.artist, artistBlock.billing_order, JSON.stringify(originalTitles), 'spreadsheet import']
-        )).rows[0];
-        for (const s of artistBlock.songs) {
-          const song = await findOrCreateSong(artistBlock.artist, s.song);
-          if (s.already_on_spotify && song.spotify_status === 'pending') {
-            await pool.query(`UPDATE songs SET spotify_status='assumed_added' WHERE id=$1`, [song.id]);
-          }
-          await pool.query(
-            `INSERT INTO show_songs (show_artist_id, song_id, play_order, known, liked_now, status, already_on_spotify, added_to_seen)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [artistRow.id, song.id, s.play_order, s.known, s.liked_now, s.status, s.already_on_spotify, s.already_on_spotify]
-          );
-        }
+        await insertArtistBlock(showRow.id, artistBlock);
       }
       imported++;
     }
-    res.json({ ok: true, imported, skipped, geoFilled, geoFailures });
+    res.json({ ok: true, imported, skipped, geoFilled, geoFailures, artistsAdded });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -236,7 +259,9 @@ app.get('/api/shows/pending', requireAuth, async (req, res) => {
 app.get('/api/shows/all', requireAuth, async (req, res) => {
   const rows = (await pool.query(`
     SELECT sh.id, sh.date, sh.venue, sh.city, sh.state, sh.stage,
-      (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner
+      (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner,
+      (SELECT sa.setlistfm_url FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_url,
+      (SELECT sa.setlistfm_id FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_id
     FROM shows sh ORDER BY sh.date DESC
   `)).rows;
   res.json(rows);
@@ -437,19 +462,65 @@ app.post('/api/setlistfm/match-historical', requireAuth, async (req, res) => {
 
     if (best) {
       await pool.query(
-        'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2 WHERE id=$3',
-        [best.tour ? best.tour.name : null, best.url || null, row.id]
+        'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2, setlistfm_id=$3 WHERE id=$4',
+        [best.tour ? best.tour.name : null, best.url || null, best.id || null, row.id]
       );
       matched++;
     } else {
       await pool.query('UPDATE show_artists SET setlistfm_checked=true WHERE id=$1', [row.id]);
       noMatch++;
-      unmatched.push({ artist: row.artist, date: row.date, venue: row.venue });
+      unmatched.push({ id: row.id, artist: row.artist, date: row.date, venue: row.venue });
     }
   }
 
   const stillRemaining = Number(remainingRow.c) - rows.length;
   res.json({ ok: true, matched, noMatch, unmatched, remaining: Math.max(0, stillRemaining), done: rows.length < limit });
+});
+
+// Manual fallback for shows the automatic date+artist match couldn't
+// resolve — usually an opener whose setlist was never logged separately,
+// or an artist name that doesn't exactly match setlist.fm's listing. Lets
+// you search with an edited name and pick the right result yourself.
+app.post('/api/setlistfm/search', requireAuth, async (req, res) => {
+  const { artistName, date } = req.body;
+  try {
+    const candidates = date
+      ? await setlistfm.searchSetlistsByArtistAndDate(artistName, date)
+      : await setlistfm.searchSetlistsByArtist(artistName);
+    res.json(candidates.slice(0, 10).map(c => ({
+      id: c.id, url: c.url, date: c.eventDate,
+      venue: c.venue ? c.venue.name : '', city: c.venue && c.venue.city ? c.venue.city.name : '',
+      tour: c.tour ? c.tour.name : null,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/setlistfm/manual-match/apply', requireAuth, async (req, res) => {
+  const { showArtistId, setlistId } = req.body;
+  try {
+    const setlist = await setlistfm.getSetlist(setlistId);
+    if (!setlist) return res.status(404).json({ error: 'Setlist not found' });
+    await pool.query(
+      'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2, setlistfm_id=$3 WHERE id=$4',
+      [setlist.tour ? setlist.tour.name : null, setlist.url || null, setlist.id, showArtistId]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cached (10 min) list of setlist IDs you've marked "I Was There" on — lets
+// the Sync page show which matched shows still need that manual click.
+let attendedCache = { at: 0, ids: null };
+app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
+  try {
+    if (!attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
+      const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
+      if (!cfg.setlistfm_username) return res.json([]);
+      const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+      attendedCache = { at: Date.now(), ids: attended.map(a => a.id) };
+    }
+    res.json(attendedCache.ids);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ---------- fill gaps ----------
@@ -1149,8 +1220,20 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
 
   let autoMarked = 0;
   const needsAddition = [];
+  const attemptedIds = [];
+  let searchErrors = 0;
+  let firstSearchError = null;
+  let noCandidates = 0;
+  let stoppedEarly = false;
 
   for (const song of gapSongs) {
+    // If Spotify search is failing systemically (bad/expired token, etc.),
+    // stop burning through the batch and surface it immediately — silently
+    // continuing past every failure was exactly what made this look like
+    // "nothing missing" instead of "everything is failing." Songs not yet
+    // attempted stay eligible for next run rather than being marked done.
+    if (searchErrors >= 5) { stoppedEarly = true; break; }
+
     // Which playlists does this song actually belong in, across every show it appears at?
     const companionRows = (await pool.query(`
       SELECT DISTINCT c.name FROM show_songs ss
@@ -1162,10 +1245,12 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     const applicableTargets = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
 
     let candidates = [];
-    try { candidates = await spotify.searchTrack(song.title, song.artist); } catch (e) { continue; }
+    try { candidates = await spotify.searchTrack(song.title, song.artist); }
+    catch (e) { searchErrors++; firstSearchError = firstSearchError || e.message; continue; }
+    attemptedIds.push(song.id);
     await ors.sleep(120);
     const best = candidates[0];
-    if (!best) continue;
+    if (!best) { noCandidates++; continue; }
 
     const missingFrom = applicableTargets.filter(t => !playlistIdSets[t.key].has(best.id));
     const alreadyIn = applicableTargets.filter(t => playlistIdSets[t.key].has(best.id));
@@ -1189,9 +1274,12 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     }
   }
 
-  const attemptedIds = gapSongs.map(s => s.id);
   const processedSoFar = excludeIds.length + attemptedIds.length;
-  res.json({ autoMarked, needsAddition, total, attemptedIds, processed: processedSoFar, done: gapSongs.length < limit });
+  res.json({
+    autoMarked, needsAddition, total, attemptedIds, processed: processedSoFar,
+    done: !stoppedEarly && gapSongs.length < limit,
+    noCandidates, searchErrors, searchErrorMessage: firstSearchError, stoppedEarly,
+  });
 });
 
 app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
