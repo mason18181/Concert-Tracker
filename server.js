@@ -75,7 +75,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
 
       const venueKey = `${show.venue}, ${show.city}, ${show.state}`;
       if (!(venueKey in venueCoordCache)) {
-        try { venueCoordCache[venueKey] = await ors.geocode(venueKey); }
+        try { venueCoordCache[venueKey] = await ors.geocodeVenue(show.venue, show.city, show.state); }
         catch (e) { venueCoordCache[venueKey] = null; }
       }
       const venueCoord = venueCoordCache[venueKey];
@@ -174,7 +174,7 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 
     // Geocode venue up front; origin gets (re)geocoded when the user confirms it during tagging.
     try {
-      const venueCoord = await ors.geocode(`${venue}, ${city}, ${state || ''}`);
+      const venueCoord = await ors.geocodeVenue(venue, city, state);
       if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, showRow.id]);
     } catch (e) { /* non-fatal — travel distance can be filled in later */ }
 
@@ -348,13 +348,17 @@ app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// Backs a show's review out to "not started" — used when someone wants to
-// abandon progress on a show rather than push through to completion. Leaves
+// Backs a show's review out to wherever it was before this editing session
+// started (usually 'new', but 'complete' if you were just fixing a mistake
+// on an already-finished show) — used when someone wants to abandon this
+// session's progress rather than push through to completion. Leaves
 // whatever flags/matches were already saved in place (harmless, re-editable
 // next time) — this only resets which step it's parked on.
+const VALID_STAGES = ['new', 'tagged', 'spotify_reviewed', 'complete'];
 app.post('/api/shows/:id/reset-stage', requireAuth, async (req, res) => {
-  await pool.query(`UPDATE shows SET stage='new' WHERE id=$1`, [Number(req.params.id)]);
-  res.json({ ok: true });
+  const stage = VALID_STAGES.includes(req.body.stage) ? req.body.stage : 'new';
+  await pool.query(`UPDATE shows SET stage=$1 WHERE id=$2`, [stage, Number(req.params.id)]);
+  res.json({ ok: true, stage });
 });
 
 // ---------- fill gaps ----------
@@ -556,30 +560,6 @@ app.post('/api/shows/:id/playlist-submit', requireAuth, async (req, res) => {
 
   await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
   res.json({ ok: true, added });
-});
-
-// Re-searches Spotify for every song currently marked "excluded" — for when
-// a band releases an official studio/live version of something after you
-// saw it, and it wasn't findable at review time. Only returns songs that
-// now have at least one candidate, so this stays quiet otherwise.
-app.get('/api/spotify/recheck-excluded', requireAuth, async (req, res) => {
-  const excluded = (await pool.query(`SELECT id, artist, title FROM songs WHERE spotify_status='excluded'`)).rows;
-  const out = [];
-  for (const song of excluded) {
-    let candidates = [];
-    try { candidates = await spotify.searchTrack(song.title, song.artist); } catch (e) { /* skip on search failure */ }
-    if (candidates.length) out.push({ songId: song.id, artist: song.artist, title: song.title, candidates: candidates.slice(0, 3) });
-  }
-  res.json(out);
-});
-
-app.post('/api/spotify/recheck-excluded/apply', requireAuth, async (req, res) => {
-  const { songId, track } = req.body;
-  await pool.query(
-    `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
-    [track.id, track.name, track.albumName, track.albumArtUrl, songId]
-  );
-  res.json({ ok: true });
 });
 
 // ---------- reports ----------
@@ -1013,14 +993,16 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
   res.json({ songs: rows });
 });
 
-// Re-searches every gap song on Spotify, and where a match now exists,
-// checks it against what's ACTUALLY in each of the three real playlists
-// (not just this app's own added_to_* bookkeeping) before deciding what to
-// do: if it's already sitting in a playlist, that just means the app's
-// records were stale — mark it as added and move on, no Spotify write. If
-// it's genuinely missing, surface it for you to approve on the Sync page.
-// Missed/chose-not-to-see songs are excluded from the base gaps query
-// already, so they never reach this check either.
+// Re-searches every song that isn't yet tied to a real Spotify track ID —
+// this includes historical rows your spreadsheet marked "already on
+// Spotify" (assumed_added), since being marked that way never actually
+// searched for or recorded which track it corresponds to. Wherever a match
+// now exists, checks it against what's ACTUALLY in each of the three real
+// playlists (not just this app's own added_to_* bookkeeping) before
+// deciding what to do: if it's already sitting in a playlist, that just
+// means the app's records were stale — record the real track ID and move
+// on, no Spotify write. If it's genuinely missing, surface it for you to
+// approve on the Sync page. Missed/chose-not-to-see songs are excluded.
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   const targetDefs = [
@@ -1038,10 +1020,8 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     SELECT DISTINCT s.id, s.artist, s.title
     FROM show_songs ss
     JOIN show_artists sa ON sa.id = ss.show_artist_id
-    JOIN shows sh ON sh.id = sa.show_id
     JOIN songs s ON s.id = ss.song_id
-    WHERE ss.status = 'seen'
-      AND ((sh.setlistfm_event_id IS NULL AND ss.already_on_spotify = false) OR s.spotify_status = 'excluded')
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
   `)).rows;
 
   let autoMarked = 0;
@@ -1134,13 +1114,7 @@ app.post('/api/admin/backfill-travel', requireAuth, async (req, res) => {
     try {
       let venueCoord = (sh.venue_lat && sh.venue_lng) ? { lat: sh.venue_lat, lng: sh.venue_lng } : null;
       if (!venueCoord) {
-        venueCoord = await ors.geocode(`${sh.venue}, ${sh.city}, ${sh.state || ''}`);
-        if (!venueCoord) {
-          // The specific venue name wasn't found — fall back to the city
-          // itself so travel distance is at least approximately right,
-          // rather than leaving it blank entirely.
-          venueCoord = await ors.geocode(`${sh.city}, ${sh.state || ''}`);
-        }
+        venueCoord = await ors.geocodeVenue(sh.venue, sh.city, sh.state);
         if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, sh.id]);
       }
       if (!venueCoord) {
