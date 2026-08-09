@@ -66,21 +66,51 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
   try {
     const seedPath = path.join(__dirname, 'seed', 'historical_seed.json');
     const shows = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
-    let imported = 0, skipped = 0;
+    let imported = 0, skipped = 0, geoFilled = 0;
     const venueCoordCache = {};
 
     for (const show of shows) {
-      const already = (await pool.query('SELECT id FROM shows WHERE date=$1 AND venue=$2', [show.date, show.venue])).rows[0];
-      if (already) { skipped++; continue; }
+      const already = (await pool.query('SELECT id, distance_miles, duration_minutes FROM shows WHERE date=$1 AND venue=$2', [show.date, show.venue])).rows[0];
+      if (already) {
+        skipped++;
+        // Already imported, but if it's still missing travel data (e.g. a
+        // past geocoding failure), retry just that part — don't touch its
+        // songs/companions again, just fill in what's missing.
+        if (already.distance_miles === null || already.duration_minutes === null) {
+          const venueKey = `${show.venue}, ${show.city}, ${show.state}`;
+          if (!(venueKey in venueCoordCache)) {
+            try { venueCoordCache[venueKey] = await ors.geocodeVenue(show.venue, show.city, show.state); }
+            catch (e) { venueCoordCache[venueKey] = null; }
+            await ors.sleep(250);
+          }
+          const venueCoord = venueCoordCache[venueKey];
+          let originCoord = null;
+          try { originCoord = await ors.geocode(show.origin_address); } catch (e) {}
+          await ors.sleep(250);
+          if (venueCoord && originCoord) {
+            try {
+              const distance = await ors.drivingDistance(originCoord, venueCoord);
+              await pool.query(
+                'UPDATE shows SET venue_lat=$1, venue_lng=$2, origin_lat=$3, origin_lng=$4, distance_miles=$5, duration_minutes=$6 WHERE id=$7',
+                [venueCoord.lat, venueCoord.lng, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, already.id]
+              );
+              geoFilled++;
+            } catch (e) {}
+          }
+        }
+        continue;
+      }
 
       const venueKey = `${show.venue}, ${show.city}, ${show.state}`;
       if (!(venueKey in venueCoordCache)) {
         try { venueCoordCache[venueKey] = await ors.geocodeVenue(show.venue, show.city, show.state); }
         catch (e) { venueCoordCache[venueKey] = null; }
+        await ors.sleep(250);
       }
       const venueCoord = venueCoordCache[venueKey];
       let originCoord = null;
       try { originCoord = await ors.geocode(show.origin_address); } catch (e) {}
+      await ors.sleep(250);
       let distance = null;
       if (venueCoord && originCoord) {
         try { distance = await ors.drivingDistance(originCoord, venueCoord); } catch (e) {}
@@ -121,7 +151,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
       imported++;
     }
-    res.json({ ok: true, imported, skipped });
+    res.json({ ok: true, imported, skipped, geoFilled });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -159,8 +189,8 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 
     const songs = setlistfm.flattenSetlistSongs(entry);
     const artistRow = (await pool.query(
-      'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm']
+      'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source, tour_name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm', entry.tour ? entry.tour.name : null]
     )).rows[0];
 
     let order = 1;
@@ -393,8 +423,8 @@ app.post('/api/shows/:id/fill-gap/apply', requireAuth, async (req, res) => {
   // reorder) don't get misread as "most of the setlist was removed."
   const sourceLabel = `filled in from ${setlist.eventDate} at ${setlist.venue.name}`;
   await pool.query(
-    'UPDATE show_artists SET original_setlist=$1, setlist_source=$2 WHERE id=$3',
-    [JSON.stringify(songs.map(s => s.name)), sourceLabel, showArtistId]
+    'UPDATE show_artists SET original_setlist=$1, setlist_source=$2, tour_name=$3 WHERE id=$4',
+    [JSON.stringify(songs.map(s => s.name)), sourceLabel, setlist.tour ? setlist.tour.name : null, showArtistId]
   );
   res.json({ ok: true, songCount: songs.length });
 });
@@ -838,16 +868,18 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
 // Drilldown detail behind each superlatives row.
 app.get('/api/superlatives/drilldown/bands-seen/:artist', requireAuth, async (req, res) => {
   const rows = (await pool.query(`
-    SELECT sh.date, sh.venue, sh.city, sh.state, count(ss.id) AS song_count
-    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id
-    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state ORDER BY sh.date
+    SELECT sh.date, sh.venue, sh.city, sh.state, sa.tour_name, count(ss.id) AS song_count,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state, sa.tour_name ORDER BY sh.date
   `, [req.params.artist])).rows;
   res.json(rows);
 });
 
 app.get('/api/superlatives/drilldown/set/:date/:artist', requireAuth, async (req, res) => {
   const rows = (await pool.query(`
-    SELECT s.title, ss.play_order, ss.status, ss.known
+    SELECT s.title, ss.play_order, ss.known
     FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
     WHERE sh.date=$1 AND sa.artist=$2 ORDER BY ss.play_order
   `, [req.params.date, req.params.artist])).rows;
@@ -1004,6 +1036,9 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
 // on, no Spotify write. If it's genuinely missing, surface it for you to
 // approve on the Sync page. Missed/chose-not-to-see songs are excluded.
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
+  const limit = 40; // keeps each call well under a minute even including Spotify round-trips
+  const offset = Number(req.query.offset) || 0;
+
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   const targetDefs = [
     { key: 'seen', playlistId: cfg.seen_playlist_id },
@@ -1016,13 +1051,22 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     catch (e) { playlistIdSets[t.key] = new Set(); }
   }
 
+  const totalRow = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+  `)).rows[0];
+  const total = Number(totalRow.c);
+
   const gapSongs = (await pool.query(`
     SELECT DISTINCT s.id, s.artist, s.title
     FROM show_songs ss
     JOIN show_artists sa ON sa.id = ss.show_artist_id
     JOIN songs s ON s.id = ss.song_id
     WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
-  `)).rows;
+    ORDER BY s.id
+    LIMIT $1 OFFSET $2
+  `, [limit, offset])).rows;
 
   let autoMarked = 0;
   const needsAddition = [];
@@ -1040,6 +1084,7 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
 
     let candidates = [];
     try { candidates = await spotify.searchTrack(song.title, song.artist); } catch (e) { continue; }
+    await ors.sleep(120);
     const best = candidates[0];
     if (!best) continue;
 
@@ -1065,7 +1110,8 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     }
   }
 
-  res.json({ autoMarked, needsAddition });
+  const nextOffset = offset + gapSongs.length;
+  res.json({ autoMarked, needsAddition, total, processed: nextOffset, done: nextOffset >= total });
 });
 
 app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
