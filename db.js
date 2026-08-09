@@ -103,6 +103,8 @@ async function initSchema() {
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS original_setlist JSONB;
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlist_source TEXT DEFAULT 'setlist.fm';
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS tour_name TEXT;
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_checked BOOLEAN DEFAULT false;
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_url TEXT;
   `);
 
   await dedupeSongs();
