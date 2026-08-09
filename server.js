@@ -116,14 +116,8 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
         // past geocoding failure), retry just that part — don't touch its
         // songs/companions again, just fill in what's missing.
         if (already.distance_miles === null || already.duration_minutes === null) {
-          let venueCoord = null, venueErr = null, originCoord = null, originErr = null, distErr = null;
-          try { venueCoord = await ors.geocode(`${show.venue}, ${show.city}, ${show.state}`); }
-          catch (e) { venueErr = e.message; }
-          if (!venueCoord) {
-            await ors.sleep(250);
-            try { venueCoord = await ors.geocode(`${show.city}, ${show.state}`); }
-            catch (e) { venueErr = venueErr || e.message; }
-          }
+          let venueErr = null, originCoord = null, originErr = null, distErr = null;
+          const venueCoord = await ors.geocodeVenue(show.venue, show.city, show.state);
           await ors.sleep(250);
           try { originCoord = await ors.geocode(show.origin_address); } catch (e) { originErr = e.message; }
           await ors.sleep(250);
@@ -138,7 +132,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
             } catch (e) { distErr = e.message; }
           }
           if (!(venueCoord && originCoord && !distErr)) {
-            const reason = !venueCoord ? `Venue geocode failed: ${venueErr || `no results for "${show.venue}, ${show.city}"`}`
+            const reason = !venueCoord ? `Venue and city both failed to geocode for "${show.venue}, ${show.city}"`
               : !originCoord ? `Origin geocode failed: ${originErr || `no results for "${show.origin_address}"`}`
               : `Directions failed: ${distErr}`;
             geoFailures.push({ venue: show.venue, date: show.date, reason });
@@ -260,6 +254,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
   const rows = (await pool.query(`
     SELECT sh.id, sh.date, sh.venue, sh.city, sh.state, sh.stage,
       (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner,
+      (SELECT sa.id FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner_show_artist_id,
       (SELECT sa.setlistfm_url FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_url,
       (SELECT sa.setlistfm_id FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS setlistfm_id
     FROM shows sh ORDER BY sh.date DESC
@@ -513,7 +508,8 @@ app.post('/api/setlistfm/manual-match/apply', requireAuth, async (req, res) => {
 let attendedCache = { at: 0, ids: null };
 app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
   try {
-    if (!attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
+    const force = req.query.force === 'true';
+    if (force || !attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
       const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
       if (!cfg.setlistfm_username) return res.json([]);
       const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
@@ -577,10 +573,11 @@ app.get('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
   const showId = Number(req.params.id);
   const rows = (await pool.query(
     `SELECT s.id, s.artist, s.title, s.spotify_status, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url,
-       array_agg(ss.id) AS show_song_ids
+       array_agg(ss.id) AS show_song_ids, min(sa.billing_order) AS billing_order, min(ss.play_order) AS play_order
      FROM songs s JOIN show_songs ss ON ss.song_id=s.id JOIN show_artists sa ON sa.id=ss.show_artist_id
      WHERE sa.show_id=$1
-     GROUP BY s.id, s.artist, s.title, s.spotify_status, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url`, [showId]
+     GROUP BY s.id, s.artist, s.title, s.spotify_status, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
+     ORDER BY billing_order NULLS LAST, s.artist, play_order`, [showId]
   )).rows;
 
   const out = [];
