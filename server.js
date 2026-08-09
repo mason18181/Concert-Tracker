@@ -67,6 +67,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
     const seedPath = path.join(__dirname, 'seed', 'historical_seed.json');
     const shows = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
     let imported = 0, skipped = 0, geoFilled = 0;
+    const geoFailures = [];
     const venueCoordCache = {};
 
     for (const show of shows) {
@@ -77,15 +78,16 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
         // past geocoding failure), retry just that part — don't touch its
         // songs/companions again, just fill in what's missing.
         if (already.distance_miles === null || already.duration_minutes === null) {
-          const venueKey = `${show.venue}, ${show.city}, ${show.state}`;
-          if (!(venueKey in venueCoordCache)) {
-            try { venueCoordCache[venueKey] = await ors.geocodeVenue(show.venue, show.city, show.state); }
-            catch (e) { venueCoordCache[venueKey] = null; }
+          let venueCoord = null, venueErr = null, originCoord = null, originErr = null, distErr = null;
+          try { venueCoord = await ors.geocode(`${show.venue}, ${show.city}, ${show.state}`); }
+          catch (e) { venueErr = e.message; }
+          if (!venueCoord) {
             await ors.sleep(250);
+            try { venueCoord = await ors.geocode(`${show.city}, ${show.state}`); }
+            catch (e) { venueErr = venueErr || e.message; }
           }
-          const venueCoord = venueCoordCache[venueKey];
-          let originCoord = null;
-          try { originCoord = await ors.geocode(show.origin_address); } catch (e) {}
+          await ors.sleep(250);
+          try { originCoord = await ors.geocode(show.origin_address); } catch (e) { originErr = e.message; }
           await ors.sleep(250);
           if (venueCoord && originCoord) {
             try {
@@ -95,7 +97,13 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
                 [venueCoord.lat, venueCoord.lng, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, already.id]
               );
               geoFilled++;
-            } catch (e) {}
+            } catch (e) { distErr = e.message; }
+          }
+          if (!(venueCoord && originCoord && !distErr)) {
+            const reason = !venueCoord ? `Venue geocode failed: ${venueErr || `no results for "${show.venue}, ${show.city}"`}`
+              : !originCoord ? `Origin geocode failed: ${originErr || `no results for "${show.origin_address}"`}`
+              : `Directions failed: ${distErr}`;
+            geoFailures.push({ venue: show.venue, date: show.date, reason });
           }
         }
         continue;
@@ -151,7 +159,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
       imported++;
     }
-    res.json({ ok: true, imported, skipped, geoFilled });
+    res.json({ ok: true, imported, skipped, geoFilled, geoFailures });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -389,6 +397,59 @@ app.post('/api/shows/:id/reset-stage', requireAuth, async (req, res) => {
   const stage = VALID_STAGES.includes(req.body.stage) ? req.body.stage : 'new';
   await pool.query(`UPDATE shows SET stage=$1 WHERE id=$2`, [stage, Number(req.params.id)]);
   res.json({ ok: true, stage });
+});
+
+// Matches historical (spreadsheet-imported) shows to their real setlist.fm
+// entry by artist + exact date, which narrows results enough that a match
+// is usually unambiguous. This fills in tour_name and a link to the real
+// setlist.fm page — it does NOT and cannot mark "I was there" on your
+// setlist.fm account, since that's a website-only action with no API
+// equivalent; this only reads public setlist.fm data.
+app.post('/api/setlistfm/match-historical', requireAuth, async (req, res) => {
+  const limit = 25;
+  const rows = (await pool.query(`
+    SELECT sa.id, sa.artist, sh.date, sh.venue, sh.city
+    FROM show_artists sa JOIN shows sh ON sh.id = sa.show_id
+    WHERE sa.setlistfm_checked = false
+    ORDER BY sh.date
+    LIMIT $1
+  `, [limit])).rows;
+
+  const remainingRow = (await pool.query(`SELECT count(*) AS c FROM show_artists WHERE setlistfm_checked = false`)).rows[0];
+
+  let matched = 0, noMatch = 0;
+  const unmatched = [];
+
+  for (const row of rows) {
+    let candidates = [];
+    try {
+      const isoDate = new Date(row.date).toISOString().slice(0, 10);
+      candidates = await setlistfm.searchSetlistsByArtistAndDate(row.artist, isoDate);
+    } catch (e) { /* treat as no match, don't block the rest */ }
+    await ors.sleep(300);
+
+    // Date is already narrowed to the exact day; prefer a venue-name match
+    // among candidates for confidence, but fall back to the only/first
+    // result since same-artist-same-day is already a strong signal.
+    const venueLower = row.venue.toLowerCase();
+    const best = candidates.find(c => c.venue && c.venue.name && c.venue.name.toLowerCase().includes(venueLower.split(' ')[0]))
+      || candidates[0] || null;
+
+    if (best) {
+      await pool.query(
+        'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2 WHERE id=$3',
+        [best.tour ? best.tour.name : null, best.url || null, row.id]
+      );
+      matched++;
+    } else {
+      await pool.query('UPDATE show_artists SET setlistfm_checked=true WHERE id=$1', [row.id]);
+      noMatch++;
+      unmatched.push({ artist: row.artist, date: row.date, venue: row.venue });
+    }
+  }
+
+  const stillRemaining = Number(remainingRow.c) - rows.length;
+  res.json({ ok: true, matched, noMatch, unmatched, remaining: Math.max(0, stillRemaining), done: rows.length < limit });
 });
 
 // ---------- fill gaps ----------
@@ -868,11 +929,11 @@ app.get('/api/report/superlatives', requireAuth, async (req, res) => {
 // Drilldown detail behind each superlatives row.
 app.get('/api/superlatives/drilldown/bands-seen/:artist', requireAuth, async (req, res) => {
   const rows = (await pool.query(`
-    SELECT sh.date, sh.venue, sh.city, sh.state, sa.tour_name, count(ss.id) AS song_count,
+    SELECT sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url, count(ss.id) AS song_count,
       (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
       (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer
     FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
-    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state, sa.tour_name ORDER BY sh.date
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url ORDER BY sh.date
   `, [req.params.artist])).rows;
   res.json(rows);
 });
@@ -1035,9 +1096,30 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
 // means the app's records were stale — record the real track ID and move
 // on, no Spotify write. If it's genuinely missing, surface it for you to
 // approve on the Sync page. Missed/chose-not-to-see songs are excluded.
+// Simple in-memory cache so a multi-batch gap-check run doesn't re-fetch
+// each playlist's full track list from Spotify on every single batch —
+// that redundant work was the main reason this got slow. Cache lives for
+// 10 minutes, long enough to cover one full run.
+let playlistCache = { at: 0, sets: null };
+async function getCachedPlaylistIdSets(targetDefs) {
+  if (playlistCache.sets && Date.now() - playlistCache.at < 10 * 60 * 1000) return playlistCache.sets;
+  const sets = {};
+  for (const t of targetDefs) {
+    try { sets[t.key] = await spotify.getPlaylistTrackIds(t.playlistId); }
+    catch (e) { sets[t.key] = new Set(); }
+  }
+  playlistCache = { at: Date.now(), sets };
+  return sets;
+}
+
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const limit = 40; // keeps each call well under a minute even including Spotify round-trips
-  const offset = Number(req.query.offset) || 0;
+  // Song IDs already attempted this run (resolved or not) — passed back by
+  // the client each call. This is what actually fixes the skipping bug:
+  // OFFSET against a WHERE clause that shrinks as songs get resolved was
+  // silently skipping unresolved songs between batches. Excluding by ID
+  // instead means nothing gets skipped, whether it resolved or not.
+  const excludeIds = (req.query.excludeIds ? req.query.excludeIds.split(',') : []).map(Number).filter(Number.isFinite);
 
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   const targetDefs = [
@@ -1045,18 +1127,14 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     { key: 'wes', playlistId: cfg.wes_playlist_id },
     { key: 'dad', playlistId: cfg.dad_playlist_id },
   ];
-  const playlistIdSets = {};
-  for (const t of targetDefs) {
-    try { playlistIdSets[t.key] = await spotify.getPlaylistTrackIds(t.playlistId); }
-    catch (e) { playlistIdSets[t.key] = new Set(); }
-  }
+  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
 
   const totalRow = (await pool.query(`
     SELECT count(DISTINCT s.id) AS c
     FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
     WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
   `)).rows[0];
-  const total = Number(totalRow.c);
+  const total = Number(totalRow.c) + excludeIds.length; // stable total for progress display
 
   const gapSongs = (await pool.query(`
     SELECT DISTINCT s.id, s.artist, s.title
@@ -1064,9 +1142,10 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     JOIN show_artists sa ON sa.id = ss.show_artist_id
     JOIN songs s ON s.id = ss.song_id
     WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+      AND ($1::int[] = '{}' OR s.id != ALL($1::int[]))
     ORDER BY s.id
-    LIMIT $1 OFFSET $2
-  `, [limit, offset])).rows;
+    LIMIT $2
+  `, [excludeIds, limit])).rows;
 
   let autoMarked = 0;
   const needsAddition = [];
@@ -1110,8 +1189,9 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     }
   }
 
-  const nextOffset = offset + gapSongs.length;
-  res.json({ autoMarked, needsAddition, total, processed: nextOffset, done: nextOffset >= total });
+  const attemptedIds = gapSongs.map(s => s.id);
+  const processedSoFar = excludeIds.length + attemptedIds.length;
+  res.json({ autoMarked, needsAddition, total, attemptedIds, processed: processedSoFar, done: gapSongs.length < limit });
 });
 
 app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
