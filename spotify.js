@@ -9,7 +9,7 @@ function getAuthUrl(redirectUri, state) {
     client_id: process.env.SPOTIFY_CLIENT_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
-    scope: 'playlist-modify-public playlist-modify-private',
+    scope: 'playlist-modify-public playlist-modify-private playlist-read-private playlist-read-collaborative',
     state,
   });
   return `${ACCOUNTS_BASE}/authorize?${params.toString()}`;
