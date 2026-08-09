@@ -33,4 +33,13 @@ async function drivingDistance(origin, dest) {
   };
 }
 
-module.exports = { geocode, drivingDistance };
+// Tries the specific venue first; if that's not found (common for smaller
+// venues with spotty map-data coverage), falls back to the city itself so
+// travel distance is at least approximately right instead of blank.
+async function geocodeVenue(venue, city, state) {
+  let coord = await geocode(`${venue}, ${city || ''}, ${state || ''}`);
+  if (!coord && city) coord = await geocode(`${city}, ${state || ''}`);
+  return coord;
+}
+
+module.exports = { geocode, drivingDistance, geocodeVenue };
