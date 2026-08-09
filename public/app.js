@@ -226,7 +226,7 @@ async function renderSettings() {
     statusEl.textContent = 'Running — this can take a minute or two...';
     try {
       const r = await api('/api/import/historical', { method: 'POST' });
-      statusEl.innerHTML = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in.` +
+      statusEl.innerHTML = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in and ${r.artistsAdded} had a new artist added.` +
         (r.geoFailures.length ? `<div style="margin-top:8px;">${r.geoFailures.map(f => `<div class="error">${f.venue} (${new Date(f.date).toLocaleDateString()}): ${f.reason}</div>`).join('')}</div>` : '');
     } catch (e) { statusEl.textContent = e.message; }
   };
@@ -243,10 +243,51 @@ async function renderSettings() {
         statusEl.textContent = `Matched ${fmt(totalMatched)}, no match for ${fmt(totalNoMatch)}. ${fmt(r.remaining)} remaining...`;
         if (r.done) break;
       }
-      statusEl.innerHTML = `Done — matched ${fmt(totalMatched)} show(s), no setlist.fm match found for ${fmt(totalNoMatch)}.` +
-        (allUnmatched.length ? `<div style="margin-top:8px;">${allUnmatched.map(u => `<div class="muted">${u.artist} — ${new Date(u.date).toLocaleDateString()}, ${u.venue}</div>`).join('')}</div>` : '');
+      statusEl.innerHTML = `Done — matched ${fmt(totalMatched)} show(s), no automatic match for ${fmt(totalNoMatch)}. Usually an opener whose setlist was never logged separately, or a name that doesn't exactly match setlist.fm's listing — search manually below.`;
+      renderUnmatchedList(allUnmatched);
     } catch (e) { statusEl.textContent = e.message; }
   };
+}
+
+function renderUnmatchedList(unmatched) {
+  const container = document.createElement('div');
+  container.id = 'sfm-unmatched-list';
+  container.style.marginTop = '10px';
+  document.getElementById('match-sfm-status').after(container);
+  container.innerHTML = unmatched.map(u => `
+    <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-unmatched-row="${u.id}">
+      <div class="row" style="justify-content:space-between;">
+        <span>${u.artist} — ${new Date(u.date).toLocaleDateString()}, ${u.venue}</span>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <input class="sfm-manual-name" value="${u.artist}" style="max-width:220px;" />
+        <button class="btn secondary" data-manual-search-btn="${u.id}" data-manual-date="${new Date(u.date).toISOString().slice(0,10)}">Search setlist.fm</button>
+      </div>
+      <div id="sfm-manual-results-${u.id}"></div>
+    </div>
+  `).join('');
+  container.querySelectorAll('[data-manual-search-btn]').forEach(btn => btn.onclick = async () => {
+    const row = btn.closest('[data-unmatched-row]');
+    const name = row.querySelector('.sfm-manual-name').value.trim();
+    const resultsEl = document.getElementById(`sfm-manual-results-${btn.dataset.manualSearchBtn}`);
+    resultsEl.innerHTML = '<p class="muted">Searching...</p>';
+    try {
+      const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: btn.dataset.manualDate } });
+      if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results — try adjusting the name or removing the date filter.</p>'; return; }
+      resultsEl.innerHTML = candidates.map(c => `
+        <div class="row" style="justify-content:space-between;padding:4px 0;">
+          <span class="muted">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
+          <button class="btn secondary" data-pick-setlist="${c.id}">Use this</button>
+        </div>
+      `).join('');
+      resultsEl.querySelectorAll('[data-pick-setlist]').forEach(pickBtn => pickBtn.onclick = async () => {
+        try {
+          await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(btn.dataset.manualSearchBtn), setlistId: pickBtn.dataset.pickSetlist } });
+          row.innerHTML = `<span class="success">Matched.</span>`;
+        } catch (e) { showModal(e.message, { title: 'Error' }); }
+      });
+    } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
+  });
   document.getElementById('spotify-connect-btn').onclick = async () => {
     const { url } = await api('/api/spotify/connect');
     window.open(url, '_blank');
@@ -315,7 +356,10 @@ async function renderSync() {
   app.querySelectorAll('[data-show]').forEach(btn => {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
-  document.getElementById('gapcheck-btn').onclick = () => runGapCheck();
+  document.getElementById('gapcheck-btn').onclick = async (e) => {
+    e.target.disabled = true;
+    try { await runGapCheck(); } finally { e.target.disabled = false; }
+  };
   wireAllShowsBrowser();
 }
 
@@ -325,12 +369,18 @@ async function runGapCheck() {
   let excludeIds = [];
   let totalAutoMarked = 0;
   let allAdditions = [];
+  let totalNoCandidates = 0;
   try {
     while (true) {
       const r = await api(`/api/spotify/gap-check?excludeIds=${excludeIds.join(',')}`);
       totalAutoMarked += r.autoMarked;
       allAdditions = allAdditions.concat(r.needsAddition);
+      totalNoCandidates += r.noCandidates;
       excludeIds = excludeIds.concat(r.attemptedIds);
+      if (r.stoppedEarly) {
+        resultsEl.innerHTML = `<p class="error">Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. This usually means the Spotify connection needs to be redone (Settings → Connect Spotify). Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.</p>`;
+        return;
+      }
       resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
       if (r.done) break;
     }
@@ -339,7 +389,7 @@ async function runGapCheck() {
   const parts = [];
   if (totalAutoMarked) parts.push(`<p class="success">${fmt(totalAutoMarked)} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
   if (!allAdditions.length) {
-    if (!totalAutoMarked) parts.push('<p class="muted">Nothing missing.</p>');
+    if (!totalAutoMarked) parts.push(`<p class="muted">Nothing missing (${fmt(totalNoCandidates)} songs had no Spotify match at all — check these manually if that seems wrong).</p>`);
     resultsEl.innerHTML = parts.join('');
     return;
   }
@@ -378,13 +428,23 @@ async function wireAllShowsBrowser() {
   const listEl = document.getElementById('all-shows-list');
   const filterEl = document.getElementById('all-shows-filter');
   const shows = await api('/api/shows/all');
+  let attendedIds = [];
+  try { attendedIds = await api('/api/setlistfm/attended-ids'); } catch (e) { /* setlist.fm username may not be set yet */ }
+  const attendedSet = new Set(attendedIds);
+
+  function setlistBadge(s) {
+    if (!s.setlistfm_url) return '<span class="muted" style="font-size:11px;">not matched</span>';
+    if (s.setlistfm_id && attendedSet.has(s.setlistfm_id)) return '<span class="pill win" style="font-size:11px;">&check; marked</span>';
+    return `<a href="${s.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a>`;
+  }
+
   function draw(filterText) {
     const q = (filterText || '').toLowerCase();
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
     listEl.innerHTML = rows.slice(0, 100).map(s => `
       <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
         <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
-        <button class="btn secondary" data-edit-show="${s.id}">Edit</button>
+        <div class="row">${setlistBadge(s)}<button class="btn secondary" data-edit-show="${s.id}">Edit</button></div>
       </div>
     `).join('') || '<p class="muted">No matches.</p>';
     listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
@@ -439,7 +499,7 @@ window.moveSongUp = function (id) {
   const table = tr.closest('table[data-artist-table]');
   const prev = tr.previousElementSibling;
   if (table && prev && prev.dataset && prev.dataset.songRow) {
-    table.insertBefore(tr, prev);
+    tr.parentNode.insertBefore(tr, prev);
     refreshRowControls(table);
     persistOrder(table);
   }
@@ -450,7 +510,7 @@ window.moveSongDown = function (id) {
   const table = tr.closest('table[data-artist-table]');
   const next = tr.nextElementSibling;
   if (table && next && next.dataset && next.dataset.songRow) {
-    table.insertBefore(next, tr);
+    tr.parentNode.insertBefore(next, tr);
     refreshRowControls(table);
     persistOrder(table);
   }
