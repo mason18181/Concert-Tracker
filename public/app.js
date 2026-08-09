@@ -242,10 +242,7 @@ async function renderSettings() {
 
 // ---------------- Sync ----------------
 async function renderSync() {
-  const [pending, needsPlaylistUpdate] = await Promise.all([
-    api('/api/shows/pending'),
-    api('/api/shows/needs-playlist-update'),
-  ]);
+  const pending = await api('/api/shows/pending');
   app.innerHTML = `
     <div class="card">
       <h2>Sync</h2>
@@ -254,21 +251,11 @@ async function renderSync() {
       <div id="pending-list" style="margin-top:12px;">
         ${pending.length ? pending.map(s => `
           <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
-            <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue} <span class="muted">(${s.stage})</span></div>
+            <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
             <button class="btn secondary" data-show="${s.id}" data-stage="${s.stage === 'new' ? 'tag' : s.stage === 'tagged' ? 'spotify' : 'playlist'}">Continue</button>
           </div>
         `).join('') : '<p class="muted">Nothing pending.</p>'}
       </div>
-    </div>
-    <div class="card">
-      <h2>Playlist updates needed (${needsPlaylistUpdate.length})</h2>
-      <p class="muted" style="margin-bottom:10px;">Songs that are now matched on Spotify but haven't made it into their playlist(s) yet.</p>
-      ${needsPlaylistUpdate.length ? needsPlaylistUpdate.map(s => `
-        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
-          <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue}</div>
-          <button class="btn secondary" data-show="${s.id}" data-stage="playlist">Add to playlists</button>
-        </div>
-      `).join('') : '<p class="muted">Nothing pending.</p>'}
     </div>
     <div class="card">
       <h2>Recheck Spotify for excluded songs</h2>
@@ -390,7 +377,7 @@ async function wireAllShowsBrowser() {
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
     listEl.innerHTML = rows.slice(0, 100).map(s => `
       <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
-        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue} <span class="muted">(${s.stage})</span></div>
+        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
         <button class="btn secondary" data-edit-show="${s.id}">Edit</button>
       </div>
     `).join('') || '<p class="muted">No matches.</p>';
@@ -412,13 +399,56 @@ async function renderWizard() {
 
 function exitWizard() { wizardShowId = null; wizardStage = null; activeTab = 'sync'; renderTab(); }
 
+function refreshRowControls(table) {
+  const rows = [...table.querySelectorAll('tr[data-song-row]')];
+  rows.forEach((tr, i) => {
+    tr.querySelector('.order-num').textContent = i + 1;
+    tr.querySelector('[data-move-up]').disabled = i === 0;
+    tr.querySelector('[data-move-down]').disabled = i === rows.length - 1;
+  });
+}
+async function persistOrder(table) {
+  const orderedShowSongIds = [...table.querySelectorAll('tr[data-song-row]')].map(tr => Number(tr.dataset.songRow));
+  const artistId = table.dataset.artistTable;
+  try { await api(`/api/show-artists/${artistId}/reorder`, { method: 'POST', body: { orderedShowSongIds } }); }
+  catch (e) { showModal(e.message, { title: 'Error' }); }
+}
+// Delegated on #app (which never gets replaced, only its contents do) so
+// this works for every render without re-wiring, including rows added
+// dynamically after the fact.
+app.addEventListener('click', e => {
+  const upBtn = e.target.closest('[data-move-up]');
+  if (upBtn && !upBtn.disabled) {
+    const table = upBtn.closest('table[data-artist-table]');
+    const tr = upBtn.closest('tr');
+    const prev = tr && tr.previousElementSibling;
+    if (table && prev && prev.dataset.songRow) {
+      table.insertBefore(tr, prev);
+      refreshRowControls(table);
+      persistOrder(table);
+    }
+    return;
+  }
+  const downBtn = e.target.closest('[data-move-down]');
+  if (downBtn && !downBtn.disabled) {
+    const table = downBtn.closest('table[data-artist-table]');
+    const tr = downBtn.closest('tr');
+    const next = tr && tr.nextElementSibling;
+    if (table && next && next.dataset.songRow) {
+      table.insertBefore(next, tr);
+      refreshRowControls(table);
+      persistOrder(table);
+    }
+  }
+});
+
 async function renderTagStage(show) {
   const companions = await api('/api/companions');
   const allSongs = show.artists.flatMap(a => a.songs.map(s => ({ ...s, artistName: a.artist })));
   const companionIds = new Set(show.companions.map(c => c.id));
 
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
     <div class="card">
       <h2>Tag songs — ${new Date(show.date).toLocaleDateString()} · ${show.venue}</h2>
       ${show.artists.map(a => `
@@ -481,37 +511,16 @@ async function renderTagStage(show) {
   `;
 
   document.getElementById('back-btn').onclick = exitWizard;
+  document.getElementById('cancel-review-btn').onclick = async () => {
+    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    try {
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      exitWizard();
+    } catch (e) { showModal(e.message, { title: 'Error' }); }
+  };
   app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('.pill[data-companion]').forEach(p => p.onclick = () => p.classList.toggle('on'));
   app.querySelectorAll('[data-fillgap]').forEach(btn => btn.onclick = () => openFillGap(btn.dataset.fillgap, btn.dataset.artist));
-
-  function refreshRowControls(table) {
-    const rows = [...table.querySelectorAll('tr[data-song-row]')];
-    rows.forEach((tr, i) => {
-      tr.querySelector('.order-num').textContent = i + 1;
-      tr.querySelector('[data-move-up]').disabled = i === 0;
-      tr.querySelector('[data-move-down]').disabled = i === rows.length - 1;
-    });
-  }
-  async function persistOrder(table) {
-    const orderedShowSongIds = [...table.querySelectorAll('tr[data-song-row]')].map(tr => Number(tr.dataset.songRow));
-    const artistId = table.dataset.artistTable;
-    try { await api(`/api/show-artists/${artistId}/reorder`, { method: 'POST', body: { orderedShowSongIds } }); }
-    catch (e) { showModal(e.message, { title: 'Error' }); }
-  }
-  function wireMoveButtons(table) {
-    table.querySelectorAll('[data-move-up]').forEach(btn => btn.onclick = () => {
-      const tr = btn.closest('tr');
-      const prev = tr.previousElementSibling;
-      if (prev && prev.dataset.songRow) { table.insertBefore(tr, prev); refreshRowControls(table); persistOrder(table); }
-    });
-    table.querySelectorAll('[data-move-down]').forEach(btn => btn.onclick = () => {
-      const tr = btn.closest('tr');
-      const next = tr.nextElementSibling;
-      if (next && next.dataset.songRow) { table.insertBefore(next, tr); refreshRowControls(table); persistOrder(table); }
-    });
-  }
-  app.querySelectorAll('table[data-artist-table]').forEach(wireMoveButtons);
 
   app.querySelectorAll('[data-add-song]').forEach(btn => btn.onclick = async () => {
     const input = document.getElementById(`new-song-${btn.dataset.addSong}`);
@@ -537,7 +546,6 @@ async function renderTagStage(show) {
       `;
       table.appendChild(tr);
       refreshRowControls(table);
-      wireMoveButtons(table);
       tr.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => p.classList.toggle('on'));
       tr.querySelector('[data-remove-song]').onclick = async () => {
         if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
@@ -632,7 +640,7 @@ async function openFillGap(showArtistId, artistName) {
 async function renderSpotifyStage(show) {
   const review = await api(`/api/shows/${show.id}/spotify-review`);
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
     <div class="card">
       <h2>Review Spotify matches</h2>
       ${review.map(r => renderMatchRow(r)).join('')}
@@ -641,6 +649,13 @@ async function renderSpotifyStage(show) {
     </div>
   `;
   document.getElementById('back-btn').onclick = exitWizard;
+  document.getElementById('cancel-review-btn').onclick = async () => {
+    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    try {
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      exitWizard();
+    } catch (e) { showModal(e.message, { title: 'Error' }); }
+  };
 
   review.forEach(r => {
     const rowEl = document.getElementById(`match-${r.songId}`);
@@ -648,11 +663,15 @@ async function renderSpotifyStage(show) {
     rowEl.querySelectorAll('[data-select-track]').forEach(b => b.onclick = () => {
       const candidate = candidateStore[b.dataset.candidateKey];
       rowEl.dataset.decision = JSON.stringify({ action: 'select', track: candidate });
-      rowEl.querySelectorAll('.song-row').forEach(sr => sr.style.outline = '');
-      b.closest('.song-row').style.outline = `2px solid var(--violet)`;
+      applyRowSelection(r.songId, candidate);
     });
     const excludeBtn = rowEl.querySelector('[data-exclude]');
-    if (excludeBtn) excludeBtn.onclick = () => { rowEl.dataset.decision = JSON.stringify({ action: 'exclude' }); };
+    if (excludeBtn) excludeBtn.onclick = () => {
+      rowEl.dataset.decision = JSON.stringify({ action: 'exclude' });
+      document.getElementById(`meta-${r.songId}`).innerHTML = `${r.artist} &middot; excluded`;
+      document.getElementById(`actions-${r.songId}`).innerHTML = `<div class="muted" style="margin-left:50px;">Excluded <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button></div>`;
+      document.getElementById(`actions-${r.songId}`).querySelector('[data-manual-search]').onclick = () => openManualSpotifySearch(r, rowEl);
+    };
     const searchBtn = rowEl.querySelector('[data-manual-search]');
     if (searchBtn) searchBtn.onclick = () => openManualSpotifySearch(r, rowEl);
     const removeBtn = rowEl.querySelector('[data-remove-from-dataset]');
@@ -691,24 +710,36 @@ function renderMatchRow(r) {
   return `
     <div id="match-${r.songId}" style="margin-bottom:12px;">
       <div class="song-row">
-        <img class="art" src="${(current && current.albumArtUrl) || (r.suggested && r.suggested.albumArtUrl) || ''}" />
+        <img class="art" id="art-${r.songId}" src="${(current && current.albumArtUrl) || (r.suggested && r.suggested.albumArtUrl) || ''}" />
         <div style="flex:1;min-width:0;">
           <div style="font-weight:500;">${r.title}</div>
-          <div class="muted">${r.artist} ${current ? `&middot; ${current.albumName || ''}` : r.suggested ? `&middot; ${r.suggested.albumName}` : `&middot; ${noMatchText}`}</div>
+          <div class="muted" id="meta-${r.songId}">${r.artist} ${current ? `&middot; ${current.albumName || ''}` : r.suggested ? `&middot; ${r.suggested.albumName}` : `&middot; ${noMatchText}`}</div>
         </div>
-        <span class="pill">search</span>
       </div>
-      ${r.status === 'pending' ? `
-        <div class="row" style="margin:6px 0 0 50px;">
-          ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-select-track>${c.albumName}</button>`).join('')}
-          <button class="btn danger" data-exclude>Exclude</button>
-          <button class="btn secondary" data-manual-search>Search Spotify</button>
-          <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
-        </div>
-      ` : `<div class="muted" style="margin-left:50px;">${r.status === 'excluded' ? 'Excluded' : 'Already resolved'} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
+      <div id="actions-${r.songId}">
+        ${r.status === 'pending' ? `
+          <div class="row" style="margin:6px 0 0 50px;">
+            ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-select-track>${c.albumName}</button>`).join('')}
+            <button class="btn danger" data-exclude>Exclude</button>
+            <button class="btn secondary" data-manual-search>Search Spotify</button>
+            <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
+          </div>
+        ` : `<div class="muted" style="margin-left:50px;">${r.status === 'excluded' ? 'Excluded' : 'Already resolved'} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
+      </div>
       <div id="manual-search-${r.songId}"></div>
     </div>
   `;
+}
+
+// Updates a match row's art/text in place and collapses its action area to
+// a simple "Selected — Change" state, so picking a track actually looks
+// like something happened instead of just a green confirmation line.
+function applyRowSelection(songId, track) {
+  document.getElementById(`art-${songId}`).src = track.albumArtUrl || '';
+  document.getElementById(`meta-${songId}`).innerHTML = `${track.artist} &middot; ${track.albumName}`;
+  document.getElementById(`manual-search-${songId}`).innerHTML = '';
+  document.getElementById(`actions-${songId}`).innerHTML = `<div class="muted" style="margin-left:50px;">Selected: ${track.name} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button></div>`;
+  document.getElementById(`actions-${songId}`).querySelector('[data-manual-search]').onclick = () => openManualSpotifySearch({ songId, title: track.name, artist: track.artist }, document.getElementById(`match-${songId}`));
 }
 
 async function openManualSpotifySearch(r, rowEl) {
@@ -742,7 +773,7 @@ async function openManualSpotifySearch(r, rowEl) {
       resultsEl.querySelectorAll('[data-manual-pick]').forEach(btn => btn.onclick = () => {
         const track = candidateStore[btn.dataset.candidateKey];
         rowEl.dataset.decision = JSON.stringify({ action: 'select', track });
-        resultsEl.innerHTML = `<p class="success">Selected: ${track.name} — ${track.albumName}</p>`;
+        applyRowSelection(r.songId, track);
       });
     } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
   };
@@ -751,7 +782,7 @@ async function openManualSpotifySearch(r, rowEl) {
 async function renderPlaylistStage(show) {
   const preview = await api(`/api/shows/${show.id}/playlist-preview`);
   app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button>
+    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">Cancel review (not started)</button>
     <div class="card">
       <h2>Ready to add to playlists</h2>
       ${preview.targets.map(t => `
@@ -776,6 +807,13 @@ async function renderPlaylistStage(show) {
     </div>
   `;
   document.getElementById('back-btn').onclick = exitWizard;
+  document.getElementById('cancel-review-btn').onclick = async () => {
+    if (!confirm("Cancel this show's review and leave it as not-started? Anything already saved (song flags, matches) stays as-is, but this show goes back to the top of the queue instead of staying \"in progress.\"")) return;
+    try {
+      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST' });
+      exitWizard();
+    } catch (e) { showModal(e.message, { title: 'Error' }); }
+  };
   const drops = new Set();
   app.querySelectorAll('[data-drop]').forEach(btn => btn.onclick = () => {
     drops.add(btn.dataset.drop);
@@ -979,7 +1017,7 @@ async function renderTravel() {
     statusEl.textContent = 'Retrying geocoding for shows missing travel data...';
     try {
       const r = await api('/api/admin/backfill-travel', { method: 'POST' });
-      statusEl.textContent = `Fixed ${r.fixed} of ${r.checked} shows (${r.stillMissing} still missing).`;
+      statusEl.innerHTML = `Fixed ${r.fixed} of ${r.checked} shows.` + (r.failures.length ? `<div style="margin-top:8px;">${r.failures.map(f => `<div class="error">${f.venue}: ${f.reason}</div>`).join('')}</div>` : '');
       renderTravel();
     } catch (e) { statusEl.textContent = e.message; }
   };
@@ -991,15 +1029,15 @@ async function renderSuperlatives() {
     <div class="card">
       <h2>Bands seen the most</h2>
       <table>
-        <tr><th>Artist</th><th>Times seen</th><th>Song count</th><th>Headline %</th><th>Setlist variation %</th><th>Opener/closer variation %</th></tr>
-        ${data.bandsSeenMost.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.songCount}</td><td>${r.pctHeadline}%</td><td>${r.setlistVariationPct}%</td><td>${r.openCloseVariationPct}%</td></tr>`).join('')}
+        <tr><th>Artist</th><th>Times seen</th><th>Song count</th><th>Headline %</th><th>Setlist variation %</th><th>Opener/closer variation %</th><th></th></tr>
+        ${data.bandsSeenMost.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.songCount}</td><td>${r.pctHeadline}%</td><td>${r.setlistVariationPct}%</td><td>${r.openCloseVariationPct}%</td><td><button class="btn secondary" data-drill="bands-seen" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('')}
       </table>
     </div>
     <div class="card">
       <h2>Most songs played in a set</h2>
       <table>
-        <tr><th>Date</th><th>Artist</th><th>Songs</th></tr>
-        ${data.mostSongsInSet.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.songCount}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
+        <tr><th>Date</th><th>Artist</th><th>Songs</th><th></th></tr>
+        ${data.mostSongsInSet.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.songCount}</td><td><button class="btn secondary" data-drill="set" data-date="${new Date(r.date).toISOString().slice(0,10)}" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
       </table>
     </div>
     <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
@@ -1007,20 +1045,68 @@ async function renderSuperlatives() {
         <h2>Most new songs vs. the show before (repeat artists)</h2>
         <p class="muted" style="margin-bottom:8px;">Compares each show to that same artist's immediately preceding show — the biggest jump in new songs from one time to the next.</p>
         <table>
-          <tr><th>Artist</th><th>Times seen</th><th>New songs in a set</th></tr>
-          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.newSongsInASet}</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
+          <tr><th>Artist</th><th>Times seen</th><th>New songs in a set</th><th></th></tr>
+          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.newSongsInASet}</td><td><button class="btn secondary" data-drill="repeat-compare" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
         </table>
       </div>
       <div class="card" style="flex:1;min-width:280px;">
         <h2>Most opener/closer variation</h2>
         <p class="muted" style="margin-bottom:8px;">Limited to artists you've seen more than once.</p>
         <table>
-          <tr><th>Artist</th><th>Times seen</th><th>Variation %</th></tr>
-          ${data.mostOpenCloseVariation.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.openCloseVariationPct}%</td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
+          <tr><th>Artist</th><th>Times seen</th><th>Variation %</th><th></th></tr>
+          ${data.mostOpenCloseVariation.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.openCloseVariationPct}%</td><td><button class="btn secondary" data-drill="open-close" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
         </table>
       </div>
     </div>
   `;
+  dashBody().querySelectorAll('[data-drill]').forEach(btn => btn.onclick = () => openSuperlativeDrilldown(btn.dataset.drill, btn.dataset.artist, btn.dataset.date));
+}
+
+function openDrilldownModal(title, bodyHtml) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-box" style="max-width:600px;text-align:left;max-height:80vh;overflow-y:auto;">
+      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h2 style="margin:0;">${title}</h2>
+        <button class="btn secondary" id="close-drilldown" style="padding:4px 10px;">&times;</button>
+      </div>
+      ${bodyHtml}
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.querySelector('#close-drilldown').onclick = () => modal.remove();
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+
+async function openSuperlativeDrilldown(type, artist, date) {
+  try {
+    if (type === 'bands-seen') {
+      const rows = await api(`/api/superlatives/drilldown/bands-seen/${encodeURIComponent(artist)}`);
+      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td></tr>`).join('')}</table>`);
+    } else if (type === 'set') {
+      const rows = await api(`/api/superlatives/drilldown/set/${date}/${encodeURIComponent(artist)}`);
+      openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Status</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.status || 'seen'}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
+    } else if (type === 'open-close') {
+      const rows = await api(`/api/superlatives/drilldown/open-close/${encodeURIComponent(artist)}`);
+      openDrilldownModal(`${artist} — openers &amp; closers`, `<table><tr><th>Date</th><th>Venue</th><th>Opener</th><th>Closer</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}</td><td>${r.opener}</td><td>${r.closer}</td></tr>`).join('')}</table>`);
+    } else if (type === 'repeat-compare') {
+      const d = await api(`/api/superlatives/drilldown/repeat-compare/${encodeURIComponent(artist)}`);
+      if (!d) { openDrilldownModal(artist, '<p class="muted">Not enough data.</p>'); return; }
+      const maxLen = Math.max(d.overlap.length, d.prevOnly.length, d.currOnly.length);
+      const rows = [];
+      for (let i = 0; i < maxLen; i++) {
+        rows.push(`<tr><td>${d.overlap[i] || ''}</td><td>${i < d.overlap.length ? '' : (d.prevOnly[i - d.overlap.length] || '')}</td><td>${i < d.overlap.length ? '' : (d.currOnly[i - d.overlap.length] || '')}</td></tr>`);
+      }
+      openDrilldownModal(`${artist} — ${new Date(d.prevShow.date).toLocaleDateString()} vs ${new Date(d.currShow.date).toLocaleDateString()}`, `
+        <p class="muted">Overlapping songs first, then each show's songs the other didn't have.</p>
+        <table>
+          <tr><th>Played both times</th><th>${d.prevShow.venue} only</th><th>${d.currShow.venue} only</th></tr>
+          ${rows.join('')}
+        </table>
+      `);
+    }
+  } catch (e) { showModal(e.message, { title: 'Error' }); }
 }
 
 async function renderJourney() {
@@ -1062,8 +1148,8 @@ async function renderUnknowns() {
         <div class="stat-tile"><div class="num">${t.regret_count || 0}</div><div class="label">Regret</div></div>
       </div>
       <table>
-        <tr><th>Artist</th><th>Song</th><th>Regret</th></tr>
-        ${data.songs.map(s => `<tr><td>${s.artist}</td><td>${s.title}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td class="muted">None.</td></tr>'}
+        <tr><th>Date</th><th>Venue</th><th>Artist</th><th>Song</th><th>Regret</th></tr>
+        ${data.songs.map(s => `<tr><td>${new Date(s.date).toLocaleDateString()}</td><td>${s.venue}</td><td>${s.artist}</td><td>${s.title}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td class="muted">None.</td></tr>'}
       </table>
     </div>
   `;
