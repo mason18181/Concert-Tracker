@@ -210,6 +210,12 @@ async function renderSettings() {
       <div class="muted" id="import-status" style="margin-top:8px;"></div>
     </div>
     <div class="card">
+      <h2>Match historical shows to setlist.fm</h2>
+      <p class="muted">Finds the real setlist.fm entry for each historical show (by artist + exact date) and fills in the tour name. This reads public setlist.fm data only — it can't mark "I Was There" on your account, since that's a website-only action with no API equivalent. Safe to click more than once.</p>
+      <button class="btn secondary" id="match-sfm-btn">Match to setlist.fm</button>
+      <div class="muted" id="match-sfm-status" style="margin-top:8px;"></div>
+    </div>
+    <div class="card">
       <h2>Session</h2>
       <button class="btn danger" id="lock-btn">Lock app</button>
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
@@ -220,7 +226,25 @@ async function renderSettings() {
     statusEl.textContent = 'Running — this can take a minute or two...';
     try {
       const r = await api('/api/import/historical', { method: 'POST' });
-      statusEl.textContent = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in.`;
+      statusEl.innerHTML = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in.` +
+        (r.geoFailures.length ? `<div style="margin-top:8px;">${r.geoFailures.map(f => `<div class="error">${f.venue} (${new Date(f.date).toLocaleDateString()}): ${f.reason}</div>`).join('')}</div>` : '');
+    } catch (e) { statusEl.textContent = e.message; }
+  };
+  document.getElementById('match-sfm-btn').onclick = async () => {
+    const statusEl = document.getElementById('match-sfm-status');
+    statusEl.textContent = 'Starting...';
+    let totalMatched = 0, totalNoMatch = 0, allUnmatched = [];
+    try {
+      while (true) {
+        const r = await api('/api/setlistfm/match-historical', { method: 'POST' });
+        totalMatched += r.matched;
+        totalNoMatch += r.noMatch;
+        allUnmatched = allUnmatched.concat(r.unmatched);
+        statusEl.textContent = `Matched ${fmt(totalMatched)}, no match for ${fmt(totalNoMatch)}. ${fmt(r.remaining)} remaining...`;
+        if (r.done) break;
+      }
+      statusEl.innerHTML = `Done — matched ${fmt(totalMatched)} show(s), no setlist.fm match found for ${fmt(totalNoMatch)}.` +
+        (allUnmatched.length ? `<div style="margin-top:8px;">${allUnmatched.map(u => `<div class="muted">${u.artist} — ${new Date(u.date).toLocaleDateString()}, ${u.venue}</div>`).join('')}</div>` : '');
     } catch (e) { statusEl.textContent = e.message; }
   };
   document.getElementById('spotify-connect-btn').onclick = async () => {
@@ -298,15 +322,15 @@ async function renderSync() {
 async function runGapCheck() {
   const resultsEl = document.getElementById('gapcheck-results');
   resultsEl.innerHTML = '<p class="muted">Starting...</p>';
-  let offset = 0;
+  let excludeIds = [];
   let totalAutoMarked = 0;
   let allAdditions = [];
   try {
     while (true) {
-      const r = await api(`/api/spotify/gap-check?offset=${offset}`);
+      const r = await api(`/api/spotify/gap-check?excludeIds=${excludeIds.join(',')}`);
       totalAutoMarked += r.autoMarked;
       allAdditions = allAdditions.concat(r.needsAddition);
-      offset = r.processed;
+      excludeIds = excludeIds.concat(r.attemptedIds);
       resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
       if (r.done) break;
     }
@@ -1065,7 +1089,7 @@ async function openSuperlativeDrilldown(type, artist, date) {
   try {
     if (type === 'bands-seen') {
       const rows = await api(`/api/superlatives/drilldown/bands-seen/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td></tr>`).join('')}</table>`);
+      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th><th></th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td><td>${r.setlistfm_url ? `<a href="${r.setlistfm_url}" target="_blank" style="color:var(--violet);">view</a>` : '—'}</td></tr>`).join('')}</table>`);
     } else if (type === 'set') {
       const rows = await api(`/api/superlatives/drilldown/set/${date}/${encodeURIComponent(artist)}`);
       openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
