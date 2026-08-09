@@ -105,6 +105,7 @@ async function initSchema() {
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS tour_name TEXT;
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_checked BOOLEAN DEFAULT false;
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_url TEXT;
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_id TEXT;
   `);
 
   await dedupeSongs();
