@@ -59,4 +59,14 @@ function flattenSetlistSongs(setlist) {
   return out;
 }
 
-module.exports = { getAttendedShows, getSetlist, searchSetlistsByArtist, flattenSetlistSongs };
+// For matching a specific historical show to its real setlist.fm entry —
+// date is narrowed to that exact day (setlist.fm wants dd-MM-yyyy), so this
+// comes back with very few candidates, usually exactly one.
+async function searchSetlistsByArtistAndDate(artistName, isoDate) {
+  const [y, m, d] = isoDate.split('-');
+  const sfmDate = `${d}-${m}-${y}`;
+  const data = await sfmFetch(`/search/setlists?artistName=${encodeURIComponent(artistName)}&date=${sfmDate}`);
+  return data && data.setlist ? data.setlist : [];
+}
+
+module.exports = { getAttendedShows, getSetlist, searchSetlistsByArtist, searchSetlistsByArtistAndDate, flattenSetlistSongs };
