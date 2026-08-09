@@ -85,9 +85,14 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // entire run instead of just pausing briefly.
 async function fetchSpotify(url, options, attempt = 1) {
   const res = await fetch(url, options);
-  if (res.status === 429 && attempt <= 4) {
-    const retryAfter = Number(res.headers.get('Retry-After')) || 2;
-    await sleep((retryAfter + 1) * 1000);
+  if (res.status === 429 && attempt <= 2) {
+    // Cap the wait regardless of what Spotify's Retry-After says — a
+    // genuine QUOTA_EXCEEDED can mean a cooldown of minutes, and honoring
+    // that inline is what made a single request hang for several minutes
+    // and then fail outright. One quick retry is enough to smooth over an
+    // ordinary brief rate-limit; if it's still failing after that, it's a
+    // real quota issue and should surface immediately, not hang longer.
+    await sleep(3000);
     return fetchSpotify(url, options, attempt + 1);
   }
   return res;
