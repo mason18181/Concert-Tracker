@@ -260,8 +260,9 @@ function renderUnmatchedList(unmatched) {
         <span>${u.artist} — ${new Date(u.date).toLocaleDateString()}, ${u.venue}</span>
       </div>
       <div class="row" style="margin-top:4px;">
-        <input class="sfm-manual-name" value="${u.artist}" style="max-width:220px;" />
-        <button class="btn secondary" data-manual-search-btn="${u.id}" data-manual-date="${new Date(u.date).toISOString().slice(0,10)}">Search setlist.fm</button>
+        <input class="sfm-manual-name" value="${u.artist}" style="max-width:200px;" />
+        <input class="sfm-manual-date" type="date" value="${new Date(u.date).toISOString().slice(0,10)}" style="max-width:150px;" title="Clear this to search without a date filter" />
+        <button class="btn secondary" data-manual-search-btn="${u.id}">Search setlist.fm</button>
       </div>
       <div id="sfm-manual-results-${u.id}"></div>
     </div>
@@ -269,11 +270,12 @@ function renderUnmatchedList(unmatched) {
   container.querySelectorAll('[data-manual-search-btn]').forEach(btn => btn.onclick = async () => {
     const row = btn.closest('[data-unmatched-row]');
     const name = row.querySelector('.sfm-manual-name').value.trim();
+    const dateVal = row.querySelector('.sfm-manual-date').value; // may be cleared on purpose
     const resultsEl = document.getElementById(`sfm-manual-results-${btn.dataset.manualSearchBtn}`);
     resultsEl.innerHTML = '<p class="muted">Searching...</p>';
     try {
-      const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: btn.dataset.manualDate } });
-      if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results — try adjusting the name or removing the date filter.</p>'; return; }
+      const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: dateVal || null } });
+      if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results — try clearing the date, or double-check the spelling matches setlist.fm exactly.</p>'; return; }
       resultsEl.innerHTML = candidates.map(c => `
         <div class="row" style="justify-content:space-between;padding:4px 0;">
           <span class="muted">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
@@ -281,10 +283,12 @@ function renderUnmatchedList(unmatched) {
         </div>
       `).join('');
       resultsEl.querySelectorAll('[data-pick-setlist]').forEach(pickBtn => pickBtn.onclick = async () => {
+        pickBtn.disabled = true;
+        pickBtn.textContent = 'Saving...';
         try {
           await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(btn.dataset.manualSearchBtn), setlistId: pickBtn.dataset.pickSetlist } });
-          row.innerHTML = `<span class="success">Matched.</span>`;
-        } catch (e) { showModal(e.message, { title: 'Error' }); }
+          row.innerHTML = `<span class="success">Saved — this show is now matched.</span>`;
+        } catch (e) { showModal(e.message, { title: 'Error' }); pickBtn.disabled = false; pickBtn.textContent = 'Use this'; }
       });
     } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
   });
@@ -427,34 +431,49 @@ async function runGapCheck() {
 async function wireAllShowsBrowser() {
   const listEl = document.getElementById('all-shows-list');
   const filterEl = document.getElementById('all-shows-filter');
-  const shows = await api('/api/shows/all');
+  let shows = await api('/api/shows/all');
   let attendedSet = new Set();
+  let attendedCount = null;
   async function loadAttended(force) {
-    try { attendedSet = new Set(await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`)); }
-    catch (e) { /* setlist.fm username may not be set yet */ }
+    try {
+      const ids = await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`);
+      attendedSet = new Set(ids);
+      attendedCount = ids.length;
+    } catch (e) { /* setlist.fm username may not be set yet */ }
   }
   await loadAttended(false);
 
-  function setlistBadge(s) {
-    if (!s.setlistfm_url) {
-      return `<button class="btn secondary" data-search-inline="${s.headliner_show_artist_id}" data-search-date="${new Date(s.date).toISOString().slice(0,10)}" data-search-artist="${s.headliner || ''}" style="font-size:11px;padding:2px 8px;">search setlist.fm</button>`;
+  function artistBadge(a) {
+    if (!a.setlistfm_url) {
+      return `
+        <div style="margin:4px 0;">
+          <span class="muted" style="font-size:12px;">${a.artist}:</span>
+          <button class="btn secondary" data-search-inline="${a.id}" data-search-date="" data-search-artist="${a.artist}" style="font-size:11px;padding:2px 8px;">search setlist.fm</button>
+          <div id="inline-search-${a.id}"></div>
+        </div>`;
     }
-    if (s.setlistfm_id && attendedSet.has(s.setlistfm_id)) return '<span class="pill win" style="font-size:11px;">&check; marked</span>';
-    return `<a href="${s.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a> <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>`;
+    const marked = a.setlistfm_id && attendedSet.has(a.setlistfm_id);
+    return `
+      <div style="margin:4px 0;">
+        <span class="muted" style="font-size:12px;">${a.artist}:</span>
+        ${marked
+          ? '<span class="pill win" style="font-size:11px;">&check; marked</span>'
+          : `<a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a> <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>`}
+      </div>`;
   }
 
   function draw(filterText) {
     const q = (filterText || '').toLowerCase();
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
-    listEl.innerHTML = rows.slice(0, 100).map(s => `
-      <div data-show-block="${s.id}">
-        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
-          <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
-          <div class="row">${setlistBadge(s)}<button class="btn secondary" data-edit-show="${s.id}">Edit</button></div>
-        </div>
-        <div id="inline-search-${s.headliner_show_artist_id}"></div>
+    listEl.innerHTML = `
+      <p class="muted" style="font-size:12px;">Your setlist.fm attended count right now: ${attendedCount === null ? 'unknown (set your username in Settings)' : fmt(attendedCount)}</p>
+    ` + (rows.slice(0, 100).map(s => `
+      <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
+        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
+        ${s.artists.map(artistBadge).join('')}
+        <button class="btn secondary" data-edit-show="${s.id}" style="margin-top:4px;">Edit</button>
       </div>
-    `).join('') || '<p class="muted">No matches.</p>';
+    `).join('') || '<p class="muted">No matches.</p>');
 
     listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
       wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
@@ -471,18 +490,20 @@ async function wireAllShowsBrowser() {
       const box = document.getElementById(`inline-search-${showArtistId}`);
       box.innerHTML = `
         <div class="row" style="padding:6px 0;">
-          <input class="inline-sfm-name" value="${btn.dataset.searchArtist}" style="max-width:200px;" />
-          <button class="btn secondary" data-run-inline-search="${showArtistId}" data-inline-date="${btn.dataset.searchDate}">Search</button>
+          <input class="inline-sfm-name" value="${btn.dataset.searchArtist}" style="max-width:180px;" />
+          <input class="inline-sfm-date" type="date" value="${btn.dataset.searchDate}" style="max-width:150px;" title="Clear this to search without a date filter" />
+          <button class="btn secondary" data-run-inline-search="${showArtistId}">Search</button>
         </div>
         <div id="inline-results-${showArtistId}"></div>
       `;
       box.querySelector('[data-run-inline-search]').onclick = async () => {
         const name = box.querySelector('.inline-sfm-name').value.trim();
+        const dateVal = box.querySelector('.inline-sfm-date').value; // may be empty — that's the point
         const resultsEl = document.getElementById(`inline-results-${showArtistId}`);
         resultsEl.innerHTML = '<p class="muted">Searching...</p>';
         try {
-          const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: btn.dataset.searchDate } });
-          if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results.</p>'; return; }
+          const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: dateVal || null } });
+          if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results. Try clearing the date, or check the spelling matches setlist.fm exactly.</p>'; return; }
           resultsEl.innerHTML = candidates.map(c => `
             <div class="row" style="justify-content:space-between;padding:3px 0;">
               <span class="muted" style="font-size:12px;">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
@@ -490,12 +511,14 @@ async function wireAllShowsBrowser() {
             </div>
           `).join('');
           resultsEl.querySelectorAll('[data-pick-inline]').forEach(pickBtn => pickBtn.onclick = async () => {
+            pickBtn.disabled = true;
+            pickBtn.textContent = 'Saving...';
             try {
               await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(showArtistId), setlistId: pickBtn.dataset.pickInline } });
-              const fresh = await api('/api/shows/all');
-              shows.length = 0; shows.push(...fresh);
+              resultsEl.innerHTML = '<p class="success">Saved — updating list...</p>';
+              shows = await api('/api/shows/all');
               draw(filterEl.value);
-            } catch (e) { showModal(e.message, { title: 'Error' }); }
+            } catch (e) { showModal(e.message, { title: 'Error' }); pickBtn.disabled = false; pickBtn.textContent = 'Use this'; }
           });
         } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
       };
