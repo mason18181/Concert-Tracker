@@ -8,8 +8,126 @@
   "origin_address": "1345 Salem Drive, Alpharetta, GA 30009",
   "artists": [
    {
-    "artist": "Breaking Benjamin",
+    "artist": "Korn",
     "billing_order": 1,
+    "songs": [
+     {
+      "play_order": 1,
+      "song": "Right Now",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 2,
+      "song": "Here to Stay",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 3,
+      "song": "Rotting in Vain",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 4,
+      "song": "Somebody Someone",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 5,
+      "song": "Coming Undone",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 6,
+      "song": "Insane",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 7,
+      "song": "Y'All Want a Single",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 8,
+      "song": "Make Me Bad",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 9,
+      "song": "Shoots and Ladders",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 10,
+      "song": "Blind",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 11,
+      "song": "Twist",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 12,
+      "song": "Good God",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 13,
+      "song": "Falling Away From Me",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     },
+     {
+      "play_order": 14,
+      "song": "Freak on a Leash",
+      "known": false,
+      "liked_now": false,
+      "status": "skipped",
+      "already_on_spotify": false
+     }
+    ]
+   },
+   {
+    "artist": "Breaking Benjamin",
+    "billing_order": 2,
     "songs": [
      {
       "play_order": 1,
@@ -119,7 +237,7 @@
    },
    {
     "artist": "Motionless In White",
-    "billing_order": 2,
+    "billing_order": 3,
     "songs": [
      {
       "play_order": 1,
