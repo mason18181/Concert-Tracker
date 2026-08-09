@@ -428,27 +428,77 @@ async function wireAllShowsBrowser() {
   const listEl = document.getElementById('all-shows-list');
   const filterEl = document.getElementById('all-shows-filter');
   const shows = await api('/api/shows/all');
-  let attendedIds = [];
-  try { attendedIds = await api('/api/setlistfm/attended-ids'); } catch (e) { /* setlist.fm username may not be set yet */ }
-  const attendedSet = new Set(attendedIds);
+  let attendedSet = new Set();
+  async function loadAttended(force) {
+    try { attendedSet = new Set(await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`)); }
+    catch (e) { /* setlist.fm username may not be set yet */ }
+  }
+  await loadAttended(false);
 
   function setlistBadge(s) {
-    if (!s.setlistfm_url) return '<span class="muted" style="font-size:11px;">not matched</span>';
+    if (!s.setlistfm_url) {
+      return `<button class="btn secondary" data-search-inline="${s.headliner_show_artist_id}" data-search-date="${new Date(s.date).toISOString().slice(0,10)}" data-search-artist="${s.headliner || ''}" style="font-size:11px;padding:2px 8px;">search setlist.fm</button>`;
+    }
     if (s.setlistfm_id && attendedSet.has(s.setlistfm_id)) return '<span class="pill win" style="font-size:11px;">&check; marked</span>';
-    return `<a href="${s.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a>`;
+    return `<a href="${s.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a> <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>`;
   }
 
   function draw(filterText) {
     const q = (filterText || '').toLowerCase();
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
     listEl.innerHTML = rows.slice(0, 100).map(s => `
-      <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
-        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
-        <div class="row">${setlistBadge(s)}<button class="btn secondary" data-edit-show="${s.id}">Edit</button></div>
+      <div data-show-block="${s.id}">
+        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0;">
+          <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
+          <div class="row">${setlistBadge(s)}<button class="btn secondary" data-edit-show="${s.id}">Edit</button></div>
+        </div>
+        <div id="inline-search-${s.headliner_show_artist_id}"></div>
       </div>
     `).join('') || '<p class="muted">No matches.</p>';
+
     listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
       wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
+    });
+
+    listEl.querySelectorAll('[data-recheck-attended]').forEach(btn => btn.onclick = async () => {
+      btn.textContent = 'checking...';
+      await loadAttended(true);
+      draw(filterEl.value);
+    });
+
+    listEl.querySelectorAll('[data-search-inline]').forEach(btn => btn.onclick = () => {
+      const showArtistId = btn.dataset.searchInline;
+      const box = document.getElementById(`inline-search-${showArtistId}`);
+      box.innerHTML = `
+        <div class="row" style="padding:6px 0;">
+          <input class="inline-sfm-name" value="${btn.dataset.searchArtist}" style="max-width:200px;" />
+          <button class="btn secondary" data-run-inline-search="${showArtistId}" data-inline-date="${btn.dataset.searchDate}">Search</button>
+        </div>
+        <div id="inline-results-${showArtistId}"></div>
+      `;
+      box.querySelector('[data-run-inline-search]').onclick = async () => {
+        const name = box.querySelector('.inline-sfm-name').value.trim();
+        const resultsEl = document.getElementById(`inline-results-${showArtistId}`);
+        resultsEl.innerHTML = '<p class="muted">Searching...</p>';
+        try {
+          const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: btn.dataset.searchDate } });
+          if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results.</p>'; return; }
+          resultsEl.innerHTML = candidates.map(c => `
+            <div class="row" style="justify-content:space-between;padding:3px 0;">
+              <span class="muted" style="font-size:12px;">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
+              <button class="btn secondary" data-pick-inline="${c.id}" style="font-size:11px;padding:2px 8px;">Use this</button>
+            </div>
+          `).join('');
+          resultsEl.querySelectorAll('[data-pick-inline]').forEach(pickBtn => pickBtn.onclick = async () => {
+            try {
+              await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(showArtistId), setlistId: pickBtn.dataset.pickInline } });
+              const fresh = await api('/api/shows/all');
+              shows.length = 0; shows.push(...fresh);
+              draw(filterEl.value);
+            } catch (e) { showModal(e.message, { title: 'Error' }); }
+          });
+        } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
+      };
     });
   }
   draw('');
@@ -782,7 +832,10 @@ async function renderSpotifyStage(show) {
 function renderMatchRow(r) {
   const candidates = r.status === 'pending' ? (r.candidates || []) : [];
   const current = r.current;
-  const noMatchText = r.searchError ? `search failed: ${r.searchError}` : 'no match found';
+  const noMatchText = r.searchError ? `search failed: ${r.searchError}` : (r.status === 'assumed_added' ? 'not yet tied to a Spotify track — run "Spotify gaps check" on the Sync page' : 'no match found');
+  const statusLabel = r.status === 'excluded' ? 'Excluded'
+    : r.status === 'assumed_added' && !current ? 'Marked as already on Spotify, but not yet resolved'
+    : 'Already resolved';
   return `
     <div id="match-${r.songId}" style="margin-bottom:12px;">
       <div class="song-row">
@@ -800,7 +853,7 @@ function renderMatchRow(r) {
             <button class="btn secondary" data-manual-search>Search Spotify</button>
             <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
           </div>
-        ` : `<div class="muted" style="margin-left:50px;">${r.status === 'excluded' ? 'Excluded' : 'Already resolved'} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
+        ` : `<div class="muted" style="margin-left:50px;">${statusLabel} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
       </div>
       <div id="manual-search-${r.songId}"></div>
     </div>
