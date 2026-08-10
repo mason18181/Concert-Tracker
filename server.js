@@ -214,8 +214,9 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 
     const songs = setlistfm.flattenSetlistSongs(entry);
     const artistRow = (await pool.query(
-      'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source, tour_name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
-      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm', entry.tour ? entry.tour.name : null]
+      `INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source, tour_name, setlistfm_id, setlistfm_url, setlistfm_checked, marked_attended)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,true) RETURNING id`,
+      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm', entry.tour ? entry.tour.name : null, entry.id, entry.url || null]
     )).rows[0];
 
     let order = 1;
@@ -254,12 +255,42 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
   const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
   for (const sh of shows) {
     sh.artists = (await pool.query(
-      `SELECT id, artist, billing_order, setlistfm_url, setlistfm_id FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id`,
+      `SELECT id, artist, billing_order, setlistfm_url, setlistfm_id, marked_attended FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id`,
       [sh.id]
     )).rows;
     sh.headliner = sh.artists[0] ? sh.artists[0].artist : null;
   }
   res.json(shows);
+});
+
+// Manual fallback in case the automatic setlist.fm check below ever
+// misses a real match (e.g. a duplicate listing) — the real check is
+// primary, this is just an escape hatch.
+app.post('/api/show-artists/:id/mark-attended', requireAuth, async (req, res) => {
+  await pool.query('UPDATE show_artists SET marked_attended=true WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// Cached (10 min) list of setlist IDs you've marked "I Was There" on —
+// checked per-row against each show's matched setlist. Surfaces a clear
+// error (e.g. wrong username) instead of silently looking like zero.
+let attendedCache = { at: 0, ids: null, error: null };
+app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
+  const force = req.query.force === 'true';
+  if (force || !attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
+    const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
+    if (!cfg.setlistfm_username) {
+      attendedCache = { at: Date.now(), ids: [], error: 'No setlist.fm username set in Settings.' };
+    } else {
+      try {
+        const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+        attendedCache = { at: Date.now(), ids: attended.map(a => a.id), error: null };
+      } catch (e) {
+        attendedCache = { at: Date.now(), ids: [], error: e.message };
+      }
+    }
+  }
+  res.json({ ids: attendedCache.ids, error: attendedCache.error });
 });
 
 app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
@@ -500,22 +531,6 @@ app.post('/api/setlistfm/manual-match/apply', requireAuth, async (req, res) => {
       [setlist.tour ? setlist.tour.name : null, setlist.url || null, setlist.id, showArtistId]
     );
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Cached (10 min) list of setlist IDs you've marked "I Was There" on — lets
-// the Sync page show which matched shows still need that manual click.
-let attendedCache = { at: 0, ids: null };
-app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
-  try {
-    const force = req.query.force === 'true';
-    if (force || !attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
-      const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
-      if (!cfg.setlistfm_username) return res.json([]);
-      const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
-      attendedCache = { at: Date.now(), ids: attended.map(a => a.id) };
-    }
-    res.json(attendedCache.ids);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
