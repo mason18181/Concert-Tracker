@@ -271,6 +271,11 @@ app.post('/api/show-artists/:id/mark-attended', requireAuth, async (req, res) =>
   res.json({ ok: true });
 });
 
+app.post('/api/show-artists/:id/unmark-attended', requireAuth, async (req, res) => {
+  await pool.query('UPDATE show_artists SET marked_attended=false WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
 // Cached (10 min) list of setlist IDs you've marked "I Was There" on —
 // checked per-row against each show's matched setlist. Surfaces a clear
 // error (e.g. wrong username) instead of silently looking like zero.
@@ -551,7 +556,10 @@ app.post('/api/shows/:id/fill-gap/apply', requireAuth, async (req, res) => {
   const showId = Number(req.params.id);
   const { setlistId, showArtistId, artistName } = req.body;
   const setlist = await setlistfm.getSetlist(setlistId);
+  if (!setlist) return res.status(404).json({ error: 'Could not fetch that setlist from setlist.fm — nothing was changed.' });
   const songs = setlistfm.flattenSetlistSongs(setlist);
+  if (!songs.length) return res.status(400).json({ error: "That setlist has no songs listed on setlist.fm — nothing was changed, since replacing your set with an empty one isn't useful." });
+
   await pool.query('DELETE FROM show_songs WHERE show_artist_id=$1', [showArtistId]);
   let order = 1;
   for (const s of songs) {
@@ -564,7 +572,7 @@ app.post('/api/shows/:id/fill-gap/apply', requireAuth, async (req, res) => {
   // This is a deliberate wholesale replacement, not an ad-hoc edit — reset
   // the diff baseline to the new pull so later small edits (a swap, a
   // reorder) don't get misread as "most of the setlist was removed."
-  const sourceLabel = `filled in from ${setlist.eventDate} at ${setlist.venue.name}`;
+  const sourceLabel = `replaced from ${setlist.eventDate} at ${setlist.venue.name}`;
   await pool.query(
     'UPDATE show_artists SET original_setlist=$1, setlist_source=$2, tour_name=$3 WHERE id=$4',
     [JSON.stringify(songs.map(s => s.name)), sourceLabel, setlist.tour ? setlist.tour.name : null, showArtistId]
