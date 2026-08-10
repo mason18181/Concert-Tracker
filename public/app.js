@@ -247,6 +247,25 @@ async function renderSettings() {
       renderUnmatchedList(allUnmatched);
     } catch (e) { statusEl.textContent = e.message; }
   };
+  document.getElementById('spotify-connect-btn').onclick = async () => {
+    const { url } = await api('/api/spotify/connect');
+    window.open(url, '_blank');
+  };
+  document.getElementById('save-settings-btn').onclick = async () => {
+    await api('/api/settings', { method: 'POST', body: {
+      setlistfmUsername: document.getElementById('sfm-user').value,
+      seenPlaylistId: document.getElementById('pl-seen').value,
+      wesPlaylistId: document.getElementById('pl-wes').value,
+      dadPlaylistId: document.getElementById('pl-dad').value,
+      defaultOriginAddress: document.getElementById('origin').value,
+    }});
+    document.getElementById('settings-ok').textContent = 'Saved.';
+  };
+  document.getElementById('lock-btn').onclick = () => {
+    hostPw = null;
+    sessionStorage.removeItem('ct_pw');
+    renderLoginGate();
+  };
 }
 
 function renderUnmatchedList(unmatched) {
@@ -292,25 +311,6 @@ function renderUnmatchedList(unmatched) {
       });
     } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
   });
-  document.getElementById('spotify-connect-btn').onclick = async () => {
-    const { url } = await api('/api/spotify/connect');
-    window.open(url, '_blank');
-  };
-  document.getElementById('save-settings-btn').onclick = async () => {
-    await api('/api/settings', { method: 'POST', body: {
-      setlistfmUsername: document.getElementById('sfm-user').value,
-      seenPlaylistId: document.getElementById('pl-seen').value,
-      wesPlaylistId: document.getElementById('pl-wes').value,
-      dadPlaylistId: document.getElementById('pl-dad').value,
-      defaultOriginAddress: document.getElementById('origin').value,
-    }});
-    document.getElementById('settings-ok').textContent = 'Saved.';
-  };
-  document.getElementById('lock-btn').onclick = () => {
-    hostPw = null;
-    sessionStorage.removeItem('ct_pw');
-    renderLoginGate();
-  };
 }
 
 // ---------------- Sync ----------------
