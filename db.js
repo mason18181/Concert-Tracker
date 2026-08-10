@@ -1,4 +1,4 @@
-const { Pool } = require('pg');
+onst { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -106,6 +106,7 @@ async function initSchema() {
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_checked BOOLEAN DEFAULT false;
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_url TEXT;
     ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS setlistfm_id TEXT;
+    ALTER TABLE show_artists ADD COLUMN IF NOT EXISTS marked_attended BOOLEAN DEFAULT false;
   `);
 
   await dedupeSongs();
