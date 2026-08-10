@@ -382,7 +382,11 @@ async function runGapCheck() {
       totalNoCandidates += r.noCandidates;
       excludeIds = excludeIds.concat(r.attemptedIds);
       if (r.stoppedEarly) {
-        resultsEl.innerHTML = `<p class="error">Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. This usually means the Spotify connection needs to be redone (Settings → Connect Spotify). Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.</p>`;
+        const isQuota = /QUOTA_EXCEEDED/i.test(r.searchErrorMessage || '');
+        const guidance = isQuota
+          ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
+          : 'This usually means the Spotify connection needs to be redone (Settings → Connect Spotify).';
+        resultsEl.innerHTML = `<p class="error">Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.</p>`;
         return;
       }
       resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
@@ -433,13 +437,13 @@ async function wireAllShowsBrowser() {
   const filterEl = document.getElementById('all-shows-filter');
   let shows = await api('/api/shows/all');
   let attendedSet = new Set();
-  let attendedCount = null;
+  let attendedError = null;
   async function loadAttended(force) {
     try {
-      const ids = await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`);
-      attendedSet = new Set(ids);
-      attendedCount = ids.length;
-    } catch (e) { /* setlist.fm username may not be set yet */ }
+      const r = await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`);
+      attendedSet = new Set(r.ids);
+      attendedError = r.error;
+    } catch (e) { attendedError = e.message; }
   }
   await loadAttended(false);
 
@@ -452,22 +456,25 @@ async function wireAllShowsBrowser() {
           <div id="inline-search-${a.id}"></div>
         </div>`;
     }
-    const marked = a.setlistfm_id && attendedSet.has(a.setlistfm_id);
+    // Real check first — this is the source of truth. The local flag only
+    // matters as a fallback for a case the real check somehow misses.
+    const reallyMarked = a.setlistfm_id && attendedSet.has(a.setlistfm_id);
+    if (reallyMarked || a.marked_attended) {
+      return `<div style="margin:4px 0;"><span class="muted" style="font-size:12px;">${a.artist}:</span> <span class="pill win" style="font-size:11px;">&check; Marked</span></div>`;
+    }
     return `
       <div style="margin:4px 0;">
         <span class="muted" style="font-size:12px;">${a.artist}:</span>
-        ${marked
-          ? '<span class="pill win" style="font-size:11px;">&check; marked</span>'
-          : `<a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a> <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>`}
+        <a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a>
+        <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>
+        <button class="btn secondary" data-confirm-marked="${a.id}" style="font-size:10px;padding:2px 6px;" title="Only use this if the check above genuinely isn't picking it up">still not showing as marked? click here</button>
       </div>`;
   }
 
   function draw(filterText) {
     const q = (filterText || '').toLowerCase();
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
-    listEl.innerHTML = `
-      <p class="muted" style="font-size:12px;">Your setlist.fm attended count right now: ${attendedCount === null ? 'unknown (set your username in Settings)' : fmt(attendedCount)}</p>
-    ` + (rows.slice(0, 100).map(s => `
+    listEl.innerHTML = (attendedError ? `<p class="error" style="font-size:12px;">setlist.fm check: ${attendedError}</p>` : '') + (rows.slice(0, 100).map(s => `
       <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
         <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
         ${s.artists.map(artistBadge).join('')}
@@ -483,6 +490,15 @@ async function wireAllShowsBrowser() {
       btn.textContent = 'checking...';
       await loadAttended(true);
       draw(filterEl.value);
+    });
+
+    listEl.querySelectorAll('[data-confirm-marked]').forEach(btn => btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api(`/api/show-artists/${btn.dataset.confirmMarked}/mark-attended`, { method: 'POST' });
+        shows = await api('/api/shows/all');
+        draw(filterEl.value);
+      } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
     });
 
     listEl.querySelectorAll('[data-search-inline]').forEach(btn => btn.onclick = () => {
