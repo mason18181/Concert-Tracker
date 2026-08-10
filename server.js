@@ -12,6 +12,17 @@ app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Without this, an uncaught error in ANY single route (like the reset-stage
+// bug that just caused a crash loop) kills the entire Node process — every
+// user, every request, until Railway restarts it. This converts that into
+// a logged error instead, so one bad request can only ever fail itself.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (request likely hung, but server stayed up):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (server stayed up):', err);
+});
+
 function requireAuth(req, res, next) {
   const pw = req.header('x-host-password');
   if (!process.env.HOST_PASSWORD) return res.status(500).json({ error: 'HOST_PASSWORD not configured on server' });
@@ -450,8 +461,10 @@ app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
 // next time) — this only resets which step it's parked on.
 const VALID_STAGES = ['new', 'tagged', 'spotify_reviewed', 'complete'];
 app.post('/api/shows/:id/reset-stage', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  if (!Number.isFinite(showId)) return res.status(400).json({ error: 'Invalid show id' });
   const stage = VALID_STAGES.includes(req.body.stage) ? req.body.stage : 'new';
-  await pool.query(`UPDATE shows SET stage=$1 WHERE id=$2`, [stage, Number(req.params.id)]);
+  await pool.query(`UPDATE shows SET stage=$1 WHERE id=$2`, [stage, showId]);
   res.json({ ok: true, stage });
 });
 
