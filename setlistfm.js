@@ -20,7 +20,11 @@ async function getAttendedShows(username) {
   let page = 1;
   while (true) {
     const data = await sfmFetch(`/user/${encodeURIComponent(username)}/attended?p=${page}`);
-    if (!data || !data.setlist || !data.setlist.length) break;
+    if (!data) {
+      if (page === 1) throw new Error(`setlist.fm user "${username}" not found — check the username in Settings for typos/casing.`);
+      break; // ran past the last page, not an error
+    }
+    if (!data.setlist || !data.setlist.length) break;
     all.push(...data.setlist);
     if (data.setlist.length < (data.itemsPerPage || 20)) break;
     page += 1;
