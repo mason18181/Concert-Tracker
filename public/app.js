@@ -460,14 +460,14 @@ async function wireAllShowsBrowser() {
     // matters as a fallback for a case the real check somehow misses.
     const reallyMarked = a.setlistfm_id && attendedSet.has(a.setlistfm_id);
     if (reallyMarked || a.marked_attended) {
-      return `<div style="margin:4px 0;"><span class="muted" style="font-size:12px;">${a.artist}:</span> <span class="pill win" style="font-size:11px;">&check; Marked</span></div>`;
+      return `<div style="margin:4px 0;"><span class="muted" style="font-size:12px;">${a.artist}:</span> <span class="pill win" style="font-size:11px;">&check; I Was There</span> <button class="btn secondary" data-undo-marked="${a.id}" style="font-size:10px;padding:2px 6px;">Undo</button></div>`;
     }
     return `
       <div style="margin:4px 0;">
         <span class="muted" style="font-size:12px;">${a.artist}:</span>
-        <a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">mark "I Was There"</a>
-        <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">done? recheck</button>
-        <button class="btn secondary" data-confirm-marked="${a.id}" style="font-size:10px;padding:2px 6px;" title="Only use this if the check above genuinely isn't picking it up">still not showing as marked? click here</button>
+        <a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">Setlist Attendance</a>
+        <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">Refresh Setlist Attendance</button>
+        <button class="btn secondary" data-confirm-marked="${a.id}" style="font-size:10px;padding:2px 6px;" title="Only use this if the check above genuinely isn't picking it up">Mark as Attended (Override)</button>
       </div>`;
   }
 
@@ -496,6 +496,15 @@ async function wireAllShowsBrowser() {
       btn.disabled = true;
       try {
         await api(`/api/show-artists/${btn.dataset.confirmMarked}/mark-attended`, { method: 'POST' });
+        shows = await api('/api/shows/all');
+        draw(filterEl.value);
+      } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
+    });
+
+    listEl.querySelectorAll('[data-undo-marked]').forEach(btn => btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api(`/api/show-artists/${btn.dataset.undoMarked}/unmark-attended`, { method: 'POST' });
         shows = await api('/api/shows/all');
         draw(filterEl.value);
       } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
@@ -627,7 +636,7 @@ async function renderTagStage(show) {
             </div>
           ` : ''}
           <div class="row" style="margin-bottom:8px;">
-            <button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Fill gap from another show</button>
+            <button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Replace set from another show</button>
             <input id="new-song-${a.id}" placeholder="Song title..." style="max-width:220px;" />
             <button class="btn secondary" data-add-song="${a.id}">Add song</button>
           </div>
@@ -768,9 +777,10 @@ async function openFillGap(showArtistId, artistName) {
   modal.className = 'modal-overlay';
   modal.innerHTML = `
     <div class="modal-box" style="max-width:520px;text-align:left;max-height:80vh;overflow-y:auto;">
-      <h2>Other ${artistName} setlists</h2>
+      <h2>Replace ${artistName}'s set with another show's</h2>
+      <p class="muted" style="margin-top:-8px;">This fully replaces the current set — any known/status/regret flags already set on it will be lost.</p>
       <div id="fillgap-list"><p class="muted">Searching setlist.fm...</p></div>
-      <button class="btn secondary" id="close-fillgap" style="margin-top:14px;">Cancel</button>
+      <button class="btn danger" id="close-fillgap" style="margin-top:14px;">Cancel</button>
     </div>
   `;
   document.body.appendChild(modal);
