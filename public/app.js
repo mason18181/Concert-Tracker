@@ -22,6 +22,35 @@ function fmt(n) {
   if (n === null || n === undefined) return '0';
   return Number(n).toLocaleString('en-US');
 }
+let copyableCounter = 0;
+function copyableBlock(text, cssClass) {
+  const id = `copyable-${copyableCounter++}`;
+  return `<p class="${cssClass}" id="${id}">${text} <button class="btn secondary" data-copy-target="${id}" style="font-size:10px;padding:2px 8px;">Copy</button></p>`;
+}
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-copy-target]');
+  if (!btn) return;
+  const el = document.getElementById(btn.dataset.copyTarget);
+  const text = el.textContent.replace(/Copy\s*$/, '').trim();
+  const showCopied = () => {
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(showCopied).catch(() => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+    });
+  } else {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+  }
+});
 
 const DASHBOARD_SUBTABS = [
   ['overview', 'Overview'],
@@ -374,7 +403,11 @@ async function renderSync() {
     <div class="card">
       <h2>Spotify gaps check</h2>
       <p class="muted" style="margin-bottom:10px;">Ties every song in your dataset to a real Spotify track, including historical songs your spreadsheet marked as already added (those were never actually searched for until now). Anything that turns out to already be in the right playlist gets marked as such automatically — anything genuinely missing shows up below for you to approve. The first run will cover ~1,400 songs, so it can take several minutes; after that it's just the occasional new one.</p>
-      <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
+      <div class="row">
+        <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
+        <button class="btn secondary" id="gapcheck-stats-btn">Check current match status</button>
+      </div>
+      <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
     </div>
     <div class="card">
@@ -405,6 +438,19 @@ async function renderSync() {
     e.target.disabled = true;
     try { await runGapCheck(); } finally { e.target.disabled = false; }
   };
+  document.getElementById('gapcheck-stats-btn').onclick = async () => {
+    const el = document.getElementById('gapcheck-stats-result');
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api('/api/spotify/match-stats');
+      const statusRows = Object.entries(d.byStatus).map(([status, count]) => `<span class="pill">${status}: ${fmt(count)}</span>`).join(' ');
+      el.innerHTML = `
+        <p class="muted">Of ${fmt(d.totalSongs)} songs in your dataset, <b>${fmt(d.withRealTrackId)}</b> are actually tied to a real Spotify track right now (this is the true, persisted number — not tied to any one run).</p>
+        <p class="muted">By status: ${statusRows}</p>
+        ${d.recentlyMatched.length ? `<p class="muted" style="margin-top:6px;">Most recently matched:</p>${d.recentlyMatched.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist} &rarr; ${s.spotify_track_name} (${s.spotify_album_name})</div>`).join('')}` : ''}
+      `;
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
   wireAllShowsBrowser();
 }
 
@@ -427,13 +473,13 @@ async function runGapCheck() {
         const guidance = isQuota
           ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
           : 'This usually means the Spotify connection needs to be redone (Settings → Connect Spotify).';
-        resultsEl.innerHTML = `<p class="error">Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.</p>`;
+        resultsEl.innerHTML = copyableBlock(`Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.`, 'error');
         return;
       }
       resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
       if (r.done) break;
     }
-  } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; return; }
+  } catch (e) { resultsEl.innerHTML = copyableBlock(e.message, 'error'); return; }
 
   const parts = [];
   if (totalAutoMarked) parts.push(`<p class="success">${fmt(totalAutoMarked)} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
