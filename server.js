@@ -1281,19 +1281,12 @@ async function getCachedPlaylistIdSets(targetDefs) {
 // it's not a new decision, just recognizing a song that's already exactly
 // where you put it. Only songs that genuinely aren't in any playlist yet
 // need the real catalog-search flow (gap-check) afterward.
-app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
-  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  const targetDefs = [
-    { key: 'seen', playlistId: cfg.seen_playlist_id },
-    { key: 'wes', playlistId: cfg.wes_playlist_id },
-    { key: 'dad', playlistId: cfg.dad_playlist_id },
-  ].filter(t => t.playlistId);
-
-  if (!targetDefs.length) return res.status(400).json({ error: 'No playlist IDs configured in Settings.' });
-
-  // One lookup per playlist: normalized "artist|title" -> track. A song
-  // found in any of these gets that playlist's added_to_X flag set
-  // immediately, since we have direct proof it's already there.
+// Cached (10 min) per-playlist lookup maps, built from a full track fetch —
+// expensive to build once, so batches reuse it instead of re-fetching your
+// whole playlist on every chunk.
+let playlistLookupCache = { at: 0, lookups: null };
+async function getCachedPlaylistLookups(targetDefs) {
+  if (playlistLookupCache.lookups && Date.now() - playlistLookupCache.at < 10 * 60 * 1000) return playlistLookupCache.lookups;
   const lookups = {};
   for (const t of targetDefs) {
     const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
@@ -1306,15 +1299,50 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
     }
     lookups[t.key] = map;
   }
+  playlistLookupCache = { at: Date.now(), lookups };
+  return lookups;
+}
 
-  const unresolved = (await pool.query(`
+// The right first step for the historical backlog: instead of searching
+// Spotify's whole catalog per song (slow, quota-hungry, and picks a version
+// you didn't choose), fetch your actual playlists once and match locally
+// against what you've already curated. A match here needs no approval —
+// it's not a new decision, just recognizing a song that's already exactly
+// where you put it. Batched the same way as gap-check (excludeIds, not
+// offset) so a large backlog shows real progress instead of one long
+// silent request.
+app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
+  const limit = 200; // cheap per-item (local lookup + one DB write), so a bigger batch than gap-check's is fine
+  const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
+
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: cfg.seen_playlist_id },
+    { key: 'wes', playlistId: cfg.wes_playlist_id },
+    { key: 'dad', playlistId: cfg.dad_playlist_id },
+  ].filter(t => t.playlistId);
+  if (!targetDefs.length) return res.status(400).json({ error: 'No playlist IDs configured in Settings.' });
+
+  const lookups = await getCachedPlaylistLookups(targetDefs);
+
+  const totalRow = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+  `)).rows[0];
+  const total = Number(totalRow.c) + excludeIds.length;
+
+  const batch = (await pool.query(`
     SELECT DISTINCT s.id, s.artist, s.title
     FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
     WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
-  `)).rows;
+      AND ($1::int[] = '{}' OR s.id != ALL($1::int[]))
+    ORDER BY s.id
+    LIMIT $2
+  `, [excludeIds, limit])).rows;
 
   let matched = 0;
-  for (const song of unresolved) {
+  for (const song of batch) {
     const key = `${artistKey(song.artist)}|${normalizeTitle(song.title)}`;
     let track = null;
     const foundInTargets = [];
@@ -1334,7 +1362,9 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
     matched++;
   }
 
-  res.json({ ok: true, matched, checked: unresolved.length, remaining: unresolved.length - matched });
+  const attemptedIds = batch.map(s => s.id);
+  const processed = excludeIds.length + attemptedIds.length;
+  res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit });
 });
 
 app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
