@@ -156,6 +156,35 @@ async function getPlaylistTrackIds(playlistId) {
   return ids;
 }
 
+// Full track details (not just IDs) for every song in a playlist — one
+// cheap paginated read regardless of playlist size, versus one Spotify
+// catalog search per song. This is what makes local title/artist matching
+// possible without burning API quota per song.
+async function getPlaylistTracksFull(playlistId) {
+  if (!playlistId) return [];
+  const token = await getAccessToken();
+  const tracks = [];
+  let url = `${API_BASE}/playlists/${playlistId}/tracks?fields=next,items(track(id,name,artists(name),album(name,images)))&limit=100`;
+  while (url) {
+    const res = await fetchSpotify(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Spotify playlist read failed: ${await res.text()}`);
+    const data = await res.json();
+    for (const item of data.items || []) {
+      if (!item.track) continue;
+      tracks.push({
+        id: item.track.id,
+        name: item.track.name,
+        artists: (item.track.artists || []).map(a => a.name),
+        albumName: item.track.album ? item.track.album.name : null,
+        albumArtUrl: item.track.album && item.track.album.images && item.track.album.images[1] ? item.track.album.images[1].url : (item.track.album && item.track.album.images && item.track.album.images[0] ? item.track.album.images[0].url : null),
+      });
+    }
+    url = data.next;
+    if (url) await sleep(80);
+  }
+  return tracks;
+}
+
 async function removeTracksFromPlaylist(playlistId, trackUris) {
   if (!playlistId || !trackUris.length) return;
   const token = await getAccessToken();
@@ -170,4 +199,4 @@ async function removeTracksFromPlaylist(playlistId, trackUris) {
   }
 }
 
-module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist, getPlaylistTrackIds, removeTracksFromPlaylist };
+module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist, getPlaylistTrackIds, getPlaylistTracksFull, removeTracksFromPlaylist };
