@@ -300,13 +300,34 @@ app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
     } else {
       try {
         const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
-        attendedCache = { at: Date.now(), ids: attended.map(a => a.id), error: null };
+        attendedCache = { at: Date.now(), ids: attended.map(a => a.id), error: null, sample: attended.slice(0, 8).map(a => ({ id: a.id, artist: a.artist ? a.artist.name : '?', date: a.eventDate, venue: a.venue ? a.venue.name : '?' })) };
       } catch (e) {
-        attendedCache = { at: Date.now(), ids: [], error: e.message };
+        attendedCache = { at: Date.now(), ids: [], error: e.message, sample: [] };
       }
     }
   }
   res.json({ ids: attendedCache.ids, error: attendedCache.error });
+});
+
+// Diagnostic only — shows exactly what the attended fetch returned (raw
+// count + a sample with real artist/date/venue), plus every currently
+// matched show's stored setlistfm_id, so a mismatch is actually visible
+// instead of guessed at.
+app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
+  if (!cfg.setlistfm_username) return res.json({ error: 'No setlist.fm username set.' });
+  try {
+    const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+    const matched = (await pool.query(`SELECT artist, setlistfm_id, setlistfm_url FROM show_artists WHERE setlistfm_id IS NOT NULL ORDER BY id`)).rows;
+    res.json({
+      username: cfg.setlistfm_username,
+      attendedCount: attended.length,
+      attendedSample: attended.slice(0, 10).map(a => ({ id: a.id, artist: a.artist ? a.artist.name : '?', date: a.eventDate, venue: a.venue ? a.venue.name : '?' })),
+      matchedShows: matched,
+    });
+  } catch (e) {
+    res.json({ error: e.message, username: cfg.setlistfm_username });
+  }
 });
 
 app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
