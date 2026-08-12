@@ -188,6 +188,10 @@ async function renderSettings() {
       <h2>setlist.fm</h2>
       <div class="field"><label>Username</label><input id="sfm-user" value="${s.setlistfmUsername || ''}" /></div>
       <button class="btn secondary" id="sfm-debug-btn" style="margin-top:8px;">Test attendance check</button>
+      <div class="row" style="margin-top:8px;">
+        <input id="sfm-debug-artist" placeholder="Look up a specific artist (e.g. Lynyrd Skynyrd)" style="max-width:260px;" />
+        <button class="btn secondary" id="sfm-debug-lookup-btn">Look up</button>
+      </div>
       <div id="sfm-debug-result" style="margin-top:8px;"></div>
     </div>
     <div class="card">
@@ -239,6 +243,23 @@ async function renderSettings() {
         ${d.matchedShows.slice(0, 10).map(m => `<div class="muted" style="font-size:12px;">${m.artist} <span style="font-family:monospace;">(id: ${m.setlistfm_id})</span></div>`).join('')}
         <p style="margin-top:8px;" class="${overlap.length ? 'success' : 'error'}">Overlap found in this sample: ${overlap.length}</p>
       `;
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
+  document.getElementById('sfm-debug-lookup-btn').onclick = async () => {
+    const el = document.getElementById('sfm-debug-result');
+    const artist = document.getElementById('sfm-debug-artist').value.trim();
+    if (!artist) return;
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api(`/api/setlistfm/attended-debug?artist=${encodeURIComponent(artist)}`);
+      if (d.error) { el.innerHTML = `<p class="error">${d.error}</p>`; return; }
+      if (!d.artistLookup.length) { el.innerHTML = '<p class="muted">No show_artists rows match that name.</p>'; return; }
+      el.innerHTML = d.artistLookup.map(r => `
+        <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
+          <div>${r.artist} — ${new Date(r.date).toLocaleDateString()}, ${r.venue}</div>
+          <div class="muted">checked: ${r.setlistfm_checked} &middot; setlistfm_id: ${r.setlistfm_id || 'none'} &middot; url: ${r.setlistfm_url ? 'yes' : 'none'} &middot; marked_attended (override flag): ${r.marked_attended}</div>
+        </div>
+      `).join('');
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
   };
   document.getElementById('import-btn').onclick = async () => {
@@ -368,13 +389,13 @@ async function renderSync() {
     statusEl.textContent = 'Syncing...';
     try {
       const r = await api('/api/sync', { method: 'POST' });
+      await renderSync(); // refresh the list first — grabbing a fresh status element after, since the old one just got replaced
+      const freshStatusEl = document.getElementById('sync-status');
       if (r.newShows === 0) {
-        statusEl.textContent = '';
         showModal('No new shows detected.');
       } else {
-        statusEl.textContent = `Found ${r.newShows} new show(s).`;
+        freshStatusEl.textContent = `Found ${r.newShows} new show(s).`;
       }
-      renderSync();
     } catch (e) { statusEl.textContent = e.message; }
   };
   app.querySelectorAll('[data-show]').forEach(btn => {
@@ -499,11 +520,23 @@ async function wireAllShowsBrowser() {
         <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
         ${s.artists.map(artistBadge).join('')}
         <button class="btn secondary" data-edit-show="${s.id}" style="margin-top:4px;">Edit</button>
+        <button class="btn danger" data-delete-show="${s.id}" style="margin-top:4px;">Delete</button>
       </div>
     `).join('') || '<p class="muted">No matches.</p>');
 
     listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
       wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
+    });
+
+    listEl.querySelectorAll('[data-delete-show]').forEach(btn => btn.onclick = async () => {
+      const show = shows.find(s => s.id === Number(btn.dataset.deleteShow));
+      const label = show ? `${new Date(show.date).toLocaleDateString()} — ${show.venue}${show.headliner ? ` (${show.headliner})` : ''}` : 'this show';
+      if (!confirm(`Permanently delete ${label}? This removes all its songs, artists, and companion data. This can't be undone.`)) return;
+      try {
+        await api(`/api/shows/${btn.dataset.deleteShow}`, { method: 'DELETE' });
+        shows = await api('/api/shows/all');
+        draw(filterEl.value);
+      } catch (e) { showModal(e.message, { title: 'Error' }); }
     });
 
     listEl.querySelectorAll('[data-recheck-attended]').forEach(btn => btn.onclick = async () => {
@@ -1271,7 +1304,7 @@ async function openSuperlativeDrilldown(type, artist, date) {
   try {
     if (type === 'bands-seen') {
       const rows = await api(`/api/superlatives/drilldown/bands-seen/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th><th></th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td><td>${r.setlistfm_url ? `<a href="${r.setlistfm_url}" target="_blank" style="color:var(--violet);">view</a>` : '—'}</td></tr>`).join('')}</table>`);
+      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Headliner</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th><th></th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.headliner || '—'}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td><td>${r.setlistfm_url ? `<a href="${r.setlistfm_url}" target="_blank" style="color:var(--violet);">view</a>` : '—'}</td></tr>`).join('')}</table>`);
     } else if (type === 'set') {
       const rows = await api(`/api/superlatives/drilldown/set/${date}/${encodeURIComponent(artist)}`);
       openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
