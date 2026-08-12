@@ -207,9 +207,6 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   const newShowIds = [];
 
   for (const entry of attended) {
-    const existing = (await pool.query('SELECT id FROM shows WHERE setlistfm_event_id=$1', [entry.id])).rows[0];
-    if (existing) continue;
-
     const venue = entry.venue.name;
     const city = entry.venue.city.name;
     const state = entry.venue.city.state || null;
@@ -217,11 +214,33 @@ app.post('/api/sync', requireAuth, async (req, res) => {
     const [d, m, y] = entry.eventDate.split('-'); // setlist.fm format: dd-MM-yyyy
     const isoDate = `${y}-${m}-${d}`;
 
-    const showRow = (await pool.query(
-      `INSERT INTO shows (date, venue, city, state, country, setlistfm_event_id, origin_address, stage)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'new') RETURNING id`,
-      [isoDate, venue, city, state, country, entry.id, cfg.default_origin_address]
-    )).rows[0];
+    // setlist.fm gives a SEPARATE setlist id per artist per show — Lynyrd
+    // Skynyrd, Foreigner, and an opener at the same concert each get their
+    // own id. A show, in this app, is identified by date+venue (same as
+    // everywhere else in the codebase) — matching on entry.id here was the
+    // actual bug: syncing a second artist from an already-synced show
+    // looked "new" and created a duplicate show for the same night.
+    let showRow = (await pool.query('SELECT id FROM shows WHERE date=$1 AND venue=$2', [isoDate, venue])).rows[0];
+    const showIsNew = !showRow;
+
+    if (!showRow) {
+      showRow = (await pool.query(
+        `INSERT INTO shows (date, venue, city, state, country, setlistfm_event_id, origin_address, stage)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'new') RETURNING id`,
+        [isoDate, venue, city, state, country, entry.id, cfg.default_origin_address]
+      )).rows[0];
+      try {
+        const venueCoord = await ors.geocodeVenue(venue, city, state);
+        if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, showRow.id]);
+      } catch (e) { /* non-fatal — travel distance can be filled in later */ }
+    }
+
+    // This artist's performance specifically — skip if we already have it
+    // (this is what actually prevents the duplicate-artist/duplicate-show
+    // problem, regardless of whether the show itself was just created or
+    // already existed).
+    const existingArtist = (await pool.query('SELECT id FROM show_artists WHERE show_id=$1 AND artist=$2', [showRow.id, entry.artist.name])).rows[0];
+    if (existingArtist) continue;
 
     const songs = setlistfm.flattenSetlistSongs(entry);
     const artistRow = (await pool.query(
@@ -239,13 +258,7 @@ app.post('/api/sync', requireAuth, async (req, res) => {
       );
     }
 
-    // Geocode venue up front; origin gets (re)geocoded when the user confirms it during tagging.
-    try {
-      const venueCoord = await ors.geocodeVenue(venue, city, state);
-      if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, showRow.id]);
-    } catch (e) { /* non-fatal — travel distance can be filled in later */ }
-
-    newShowIds.push(showRow.id);
+    if (showIsNew) newShowIds.push(showRow.id);
   }
 
   await pool.query('UPDATE config SET last_synced_at=now() WHERE id=1');
@@ -262,6 +275,14 @@ app.get('/api/shows/pending', requireAuth, async (req, res) => {
 
 // Full show list (including completed ones) so a mistake can be corrected
 // after the fact — the wizard itself is safe to re-run on a complete show.
+// Deletes a show entirely (cascades to its artists/songs/companions —
+// schema already has ON DELETE CASCADE set up for this). Use for genuine
+// mistakes/duplicates, not routine editing.
+app.delete('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
+  await pool.query('DELETE FROM shows WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
 app.get('/api/shows/all', requireAuth, async (req, res) => {
   const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
   for (const sh of shows) {
@@ -319,11 +340,21 @@ app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
   try {
     const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
     const matched = (await pool.query(`SELECT artist, setlistfm_id, setlistfm_url FROM show_artists WHERE setlistfm_id IS NOT NULL ORDER BY id`)).rows;
+    let artistLookup = null;
+    if (req.query.artist) {
+      artistLookup = (await pool.query(
+        `SELECT sa.artist, sa.setlistfm_checked, sa.setlistfm_id, sa.setlistfm_url, sa.marked_attended, sh.date, sh.venue
+         FROM show_artists sa JOIN shows sh ON sh.id=sa.show_id
+         WHERE sa.artist ILIKE $1 ORDER BY sh.date DESC`,
+        [`%${req.query.artist}%`]
+      )).rows;
+    }
     res.json({
       username: cfg.setlistfm_username,
       attendedCount: attended.length,
       attendedSample: attended.slice(0, 10).map(a => ({ id: a.id, artist: a.artist ? a.artist.name : '?', date: a.eventDate, venue: a.venue ? a.venue.name : '?' })),
       matchedShows: matched,
+      artistLookup,
     });
   } catch (e) {
     res.json({ error: e.message, username: cfg.setlistfm_username });
@@ -1056,7 +1087,8 @@ app.get('/api/superlatives/drilldown/bands-seen/:artist', requireAuth, async (re
   const rows = (await pool.query(`
     SELECT sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url, count(ss.id) AS song_count,
       (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
-      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer,
+      (SELECT sa2.artist FROM show_artists sa2 WHERE sa2.show_id=sh.id ORDER BY sa2.billing_order NULLS LAST, sa2.id LIMIT 1) AS headliner
     FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
     WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url ORDER BY sh.date
   `, [req.params.artist])).rows;
