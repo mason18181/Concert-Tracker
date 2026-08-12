@@ -187,6 +187,8 @@ async function renderSettings() {
     <div class="card">
       <h2>setlist.fm</h2>
       <div class="field"><label>Username</label><input id="sfm-user" value="${s.setlistfmUsername || ''}" /></div>
+      <button class="btn secondary" id="sfm-debug-btn" style="margin-top:8px;">Test attendance check</button>
+      <div id="sfm-debug-result" style="margin-top:8px;"></div>
     </div>
     <div class="card">
       <h2>Spotify</h2>
@@ -221,6 +223,24 @@ async function renderSettings() {
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
     </div>
   `;
+  document.getElementById('sfm-debug-btn').onclick = async () => {
+    const el = document.getElementById('sfm-debug-result');
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api('/api/setlistfm/attended-debug');
+      if (d.error) { el.innerHTML = `<p class="error">${d.error}</p>`; return; }
+      const matchedIds = new Set(d.matchedShows.map(m => m.setlistfm_id));
+      const overlap = d.attendedSample.filter(a => matchedIds.has(a.id));
+      el.innerHTML = `
+        <p class="muted">Username used: <b>${d.username}</b> &middot; attended shows fetched: <b>${fmt(d.attendedCount)}</b> &middot; shows matched in your dataset: <b>${fmt(d.matchedShows.length)}</b></p>
+        <p class="muted">First few attended (raw from setlist.fm):</p>
+        ${d.attendedSample.map(a => `<div class="muted" style="font-size:12px;">${a.date} — ${a.artist} @ ${a.venue} <span style="font-family:monospace;">(id: ${a.id})</span></div>`).join('')}
+        <p class="muted" style="margin-top:8px;">Your dataset's matched show IDs (first 10):</p>
+        ${d.matchedShows.slice(0, 10).map(m => `<div class="muted" style="font-size:12px;">${m.artist} <span style="font-family:monospace;">(id: ${m.setlistfm_id})</span></div>`).join('')}
+        <p style="margin-top:8px;" class="${overlap.length ? 'success' : 'error'}">Overlap found in this sample: ${overlap.length}</p>
+      `;
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
   document.getElementById('import-btn').onclick = async () => {
     const statusEl = document.getElementById('import-status');
     statusEl.textContent = 'Running — this can take a minute or two...';
