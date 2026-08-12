@@ -1269,6 +1269,25 @@ async function getCachedPlaylistIdSets(targetDefs) {
   return sets;
 }
 
+// Queries the database directly for how many songs actually have a real
+// Spotify track tied to them right now — a persistent, always-checkable
+// number, independent of any single gap-check run's progress message
+// (which is ephemeral and only reflects that one run).
+app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
+  const byStatus = (await pool.query(`SELECT spotify_status, count(*) AS c FROM songs GROUP BY spotify_status`)).rows;
+  const withRealTrack = (await pool.query(`SELECT count(*) AS c FROM songs WHERE spotify_track_id IS NOT NULL`)).rows[0];
+  const total = (await pool.query(`SELECT count(*) AS c FROM songs`)).rows[0];
+  const recentlyMatched = (await pool.query(
+    `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
+  )).rows;
+  res.json({
+    totalSongs: Number(total.c),
+    withRealTrackId: Number(withRealTrack.c),
+    byStatus: Object.fromEntries(byStatus.map(r => [r.spotify_status, Number(r.c)])),
+    recentlyMatched,
+  });
+});
+
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const limit = 40; // keeps each call well under a minute even including Spotify round-trips
   // Song IDs already attempted this run (resolved or not) — passed back by
