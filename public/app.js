@@ -402,12 +402,18 @@ async function renderSync() {
     </div>
     <div class="card">
       <h2>Spotify gaps check</h2>
-      <p class="muted" style="margin-bottom:10px;">Ties every song in your dataset to a real Spotify track, including historical songs your spreadsheet marked as already added (those were never actually searched for until now). Anything that turns out to already be in the right playlist gets marked as such automatically — anything genuinely missing shows up below for you to approve. The first run will cover ~1,400 songs, so it can take several minutes; after that it's just the occasional new one.</p>
+      <p class="muted" style="margin-bottom:10px;">Two ways to tie your songs to real Spotify tracks. Start with the first one — it's much faster and doesn't need any approval, since it's only recognizing songs you've already added, not making new decisions.</p>
       <div class="row">
-        <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
+        <button class="btn secondary" id="match-playlist-btn">Match from my playlists (fast, recommended first)</button>
+      </div>
+      <div id="match-playlist-result" style="margin-top:10px;margin-bottom:14px;"></div>
+      <div class="row">
+        <button class="btn secondary" id="gapcheck-btn">Search Spotify catalog for anything still missing</button>
         <button class="btn secondary" id="gapcheck-stats-btn">Check current match status</button>
+        <button class="btn secondary" id="pending-additions-btn">Review songs matched but not yet added</button>
       </div>
       <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
+      <div id="pending-additions-result" style="margin-top:10px;"></div>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
     </div>
     <div class="card">
@@ -434,6 +440,16 @@ async function renderSync() {
   app.querySelectorAll('[data-show]').forEach(btn => {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
+  document.getElementById('match-playlist-btn').onclick = async (e) => {
+    e.target.disabled = true;
+    const el = document.getElementById('match-playlist-result');
+    el.innerHTML = '<p class="muted">Fetching your playlists and matching locally — this is one read per playlist, not per song, so it should be quick...</p>';
+    try {
+      const r = await api('/api/spotify/match-from-playlists', { method: 'POST' });
+      el.innerHTML = `<p class="success">Matched ${fmt(r.matched)} of ${fmt(r.checked)} unresolved songs directly from your playlists. ${fmt(r.remaining)} genuinely aren't in any configured playlist yet — use "Search Spotify catalog" below for those.</p>`;
+    } catch (e2) { el.innerHTML = `<p class="error">${e2.message}</p>`; }
+    e.target.disabled = false;
+  };
   document.getElementById('gapcheck-btn').onclick = async (e) => {
     e.target.disabled = true;
     try { await runGapCheck(); } finally { e.target.disabled = false; }
@@ -449,6 +465,16 @@ async function renderSync() {
         <p class="muted">By status: ${statusRows}</p>
         ${d.recentlyMatched.length ? `<p class="muted" style="margin-top:6px;">Most recently matched:</p>${d.recentlyMatched.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist} &rarr; ${s.spotify_track_name} (${s.spotify_album_name})</div>`).join('')}` : ''}
       `;
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
+  document.getElementById('pending-additions-btn').onclick = async () => {
+    const el = document.getElementById('pending-additions-result');
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api('/api/spotify/pending-additions');
+      if (!d.pending.length) { el.innerHTML = '<p class="muted">Nothing pending — every matched song is already in its right playlist(s).</p>'; return; }
+      el.innerHTML = `<p class="muted">${fmt(d.pending.length)} song(s) are matched but not yet in their playlist — including anything found in a past run that never got approved.</p>`;
+      renderAdditionsApprovalList(el, d.pending, true);
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
   };
   wireAllShowsBrowser();
@@ -488,30 +514,42 @@ async function runGapCheck() {
     resultsEl.innerHTML = parts.join('');
     return;
   }
-  parts.push(`<div id="gap-additions">${allAdditions.map(a => `
-    <div class="song-row" data-gap-song="${a.songId}">
-      <img class="art" src="${a.track.albumArtUrl || ''}" />
-      <div style="flex:1;min-width:0;">
-        <div>${a.title} — ${a.artist}</div>
-        <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
-      </div>
-      <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
-    </div>
-  `).join('')}</div>
-  <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(allAdditions.length)} song(s) to playlists</button>`);
   resultsEl.innerHTML = parts.join('');
+  renderAdditionsApprovalList(resultsEl, allAdditions, true);
+}
+
+// Shared by both the live gap-check run and the durable pending-additions
+// check — same approve/skip UI either way, so a match found in a past
+// interrupted run gets exactly the same review experience as one found
+// just now.
+function renderAdditionsApprovalList(container, additions, append) {
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div id="gap-additions">${additions.map(a => `
+      <div class="song-row" data-gap-song="${a.songId}">
+        <img class="art" src="${a.track.albumArtUrl || ''}" />
+        <div style="flex:1;min-width:0;">
+          <div>${a.title} — ${a.artist}</div>
+          <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
+        </div>
+        <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
+      </div>
+    `).join('')}</div>
+    <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(additions.length)} song(s) to playlists</button>
+  `;
+  if (append) { container.appendChild(wrap); } else { container.innerHTML = ''; container.appendChild(wrap); }
 
   const skipped = new Set();
-  resultsEl.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
+  wrap.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
     skipped.add(Number(btn.dataset.gapDrop));
     btn.closest('.song-row').style.opacity = '0.3';
     btn.disabled = true;
   });
-  document.getElementById('apply-gap-additions-btn').onclick = async () => {
-    const additions = allAdditions.filter(a => !skipped.has(a.songId));
+  wrap.querySelector('#apply-gap-additions-btn').onclick = async () => {
+    const toApply = additions.filter(a => !skipped.has(a.songId));
     try {
-      const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions } });
-      resultsEl.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
+      const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions: toApply } });
+      wrap.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
       renderSync();
     } catch (e) { showModal(e.message, { title: 'Error' }); }
   };
