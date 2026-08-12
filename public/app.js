@@ -401,20 +401,16 @@ async function renderSync() {
       </div>
     </div>
     <div class="card">
-      <h2>Spotify gaps check</h2>
-      <p class="muted" style="margin-bottom:10px;">Two ways to tie your songs to real Spotify tracks. Start with the first one — it's much faster and doesn't need any approval, since it's only recognizing songs you've already added, not making new decisions.</p>
-      <div class="row">
-        <button class="btn secondary" id="match-playlist-btn">Match from my playlists (fast, recommended first)</button>
-      </div>
-      <div id="match-playlist-result" style="margin-top:10px;margin-bottom:14px;"></div>
-      <div class="row">
-        <button class="btn secondary" id="gapcheck-btn">Search Spotify catalog for anything still missing</button>
-        <button class="btn secondary" id="gapcheck-stats-btn">Check current match status</button>
-        <button class="btn secondary" id="pending-additions-btn">Review songs matched but not yet added</button>
-      </div>
-      <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
-      <div id="pending-additions-result" style="margin-top:10px;"></div>
+      <h2>Spotify matching</h2>
+      <p class="muted" style="margin-bottom:10px;"><b>Step 1, one-time:</b> matches your existing songs against what's already in your playlists — fast, no approval needed, since it's just recognizing songs you've already added.</p>
+      <button class="btn secondary" id="match-playlist-btn">Match from my playlists</button>
+      <div id="match-playlist-result" style="margin-top:10px;margin-bottom:16px;"></div>
+      <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify for anything still unresolved (new shows, or whatever step 1 didn't find), and shows everything ready for your review — approve or skip each one, then push the approved ones to your playlists in one go.</p>
+      <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
+      <div class="divider" style="margin:16px 0;"></div>
+      <button class="btn secondary" id="gapcheck-stats-btn" style="font-size:11px;">Check current match status (diagnostic)</button>
+      <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
     </div>
     <div class="card">
       <h2>All shows (edit)</h2>
@@ -443,11 +439,19 @@ async function renderSync() {
   document.getElementById('match-playlist-btn').onclick = async (e) => {
     e.target.disabled = true;
     const el = document.getElementById('match-playlist-result');
-    el.innerHTML = '<p class="muted">Fetching your playlists and matching locally — this is one read per playlist, not per song, so it should be quick...</p>';
+    el.innerHTML = '<p class="muted">Fetching your playlists (one-time, this part has no progress bar but is usually quick)...</p>';
+    let excludeIds = [];
+    let totalMatched = 0;
     try {
-      const r = await api('/api/spotify/match-from-playlists', { method: 'POST' });
-      el.innerHTML = `<p class="success">Matched ${fmt(r.matched)} of ${fmt(r.checked)} unresolved songs directly from your playlists. ${fmt(r.remaining)} genuinely aren't in any configured playlist yet — use "Search Spotify catalog" below for those.</p>`;
-    } catch (e2) { el.innerHTML = `<p class="error">${e2.message}</p>`; }
+      while (true) {
+        const r = await api('/api/spotify/match-from-playlists', { method: 'POST', body: { excludeIds } });
+        totalMatched += r.matched;
+        excludeIds = excludeIds.concat(r.attemptedIds);
+        el.innerHTML = `<p class="muted">Matched ${fmt(totalMatched)} so far — checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
+        if (r.done) break;
+      }
+      el.innerHTML = `<p class="success">Matched ${fmt(totalMatched)} songs directly from your playlists. Use "Search Spotify catalog" below for whatever's still unresolved.</p>`;
+    } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
     e.target.disabled = false;
   };
   document.getElementById('gapcheck-btn').onclick = async (e) => {
@@ -467,26 +471,26 @@ async function renderSync() {
       `;
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
   };
-  document.getElementById('pending-additions-btn').onclick = async () => {
-    const el = document.getElementById('pending-additions-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/pending-additions');
-      if (!d.pending.length) { el.innerHTML = '<p class="muted">Nothing pending — every matched song is already in its right playlist(s).</p>'; return; }
-      el.innerHTML = `<p class="muted">${fmt(d.pending.length)} song(s) are matched but not yet in their playlist — including anything found in a past run that never got approved.</p>`;
-      renderAdditionsApprovalList(el, d.pending, true);
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
   wireAllShowsBrowser();
 }
 
 async function runGapCheck() {
   const resultsEl = document.getElementById('gapcheck-results');
-  resultsEl.innerHTML = '<p class="muted">Starting...</p>';
+  resultsEl.innerHTML = '<p class="muted">Checking for songs already matched but not yet added...</p>';
   let excludeIds = [];
   let totalAutoMarked = 0;
   let allAdditions = [];
   let totalNoCandidates = 0;
+
+  // Anything already matched (from this run or a past interrupted one) that
+  // hasn't been pushed to a playlist yet — surfaced here first so nothing
+  // found before ever gets lost or requires a separate button to see.
+  try {
+    const pending = await api('/api/spotify/pending-additions');
+    allAdditions = allAdditions.concat(pending.pending);
+  } catch (e) { /* non-fatal — still proceed to the catalog search */ }
+
+  resultsEl.innerHTML = '<p class="muted">Searching Spotify for anything still unresolved...</p>';
   try {
     while (true) {
       const r = await api(`/api/spotify/gap-check?excludeIds=${excludeIds.join(',')}`);
@@ -499,7 +503,13 @@ async function runGapCheck() {
         const guidance = isQuota
           ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
           : 'This usually means the Spotify connection needs to be redone (Settings → Connect Spotify).';
-        resultsEl.innerHTML = copyableBlock(`Stopped — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.`, 'error');
+        resultsEl.innerHTML = copyableBlock(`Search stopped partway — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.`, 'error');
+        if (allAdditions.length) {
+          const wrap = document.createElement('div');
+          wrap.innerHTML = `<p class="muted" style="margin-top:10px;">Even though the search stopped early, ${fmt(allAdditions.length)} song(s) are still ready to review below.</p>`;
+          resultsEl.appendChild(wrap);
+          renderAdditionsApprovalList(resultsEl, allAdditions, true);
+        }
         return;
       }
       resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
