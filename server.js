@@ -1323,7 +1323,21 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
   ].filter(t => t.playlistId);
   if (!targetDefs.length) return res.status(400).json({ error: 'No playlist IDs configured in Settings.' });
 
-  const lookups = await getCachedPlaylistLookups(targetDefs);
+  let lookups;
+  try {
+    lookups = await getCachedPlaylistLookups(targetDefs);
+  } catch (e) {
+    // This is the step that was hanging for minutes on a quota-exhausted
+    // Spotify account before finally 502ing — the retry logic itself is
+    // fixed now (fails in ~1ms instead of retrying across every page), but
+    // this catch is what actually sends you a real response instead of
+    // leaving the request to time out silently.
+    const isQuota = e.isQuotaExceeded || /QUOTA_EXCEEDED/i.test(e.message || '');
+    const guidance = isQuota
+      ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
+      : '';
+    return res.status(502).json({ error: `Couldn't read your playlists from Spotify: ${e.message}. ${guidance}` });
+  }
 
   const totalRow = (await pool.query(`
     SELECT count(DISTINCT s.id) AS c
