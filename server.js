@@ -1286,55 +1286,67 @@ async function getCachedPlaylistIdSets(targetDefs) {
 // whole playlist on every chunk.
 let playlistLookupCache = { at: 0, lookups: null };
 async function getCachedPlaylistLookups(targetDefs) {
-  if (playlistLookupCache.lookups && Date.now() - playlistLookupCache.at < 10 * 60 * 1000) return playlistLookupCache.lookups;
+  if (playlistLookupCache.lookups && Date.now() - playlistLookupCache.at < 10 * 60 * 1000) return playlistLookupCache;
   const lookups = {};
+  const failures = [];
   for (const t of targetDefs) {
-    const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
-    const map = new Map();
-    for (const track of tracks) {
-      const normTitle = normalizeTitle(track.name);
-      for (const artistName of track.artists) {
-        map.set(`${artistKey(artistName)}|${normTitle}`, track);
+    try {
+      const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
+      const map = new Map();
+      for (const track of tracks) {
+        const normTitle = normalizeTitle(track.name);
+        for (const artistName of track.artists) {
+          map.set(`${artistKey(artistName)}|${normTitle}`, track);
+        }
       }
+      lookups[t.key] = map;
+    } catch (e) {
+      // One playlist failing (wrong ID, belongs to a different account,
+      // whatever it turns out to be) shouldn't block matching against the
+      // others — this used to abort the whole operation on any single
+      // failure, which is exactly what made a Wes/Dad playlist problem
+      // silently block Seen In Concert too.
+      failures.push({ key: t.key, error: e.message });
+      lookups[t.key] = new Map();
     }
-    lookups[t.key] = map;
   }
-  playlistLookupCache = { at: Date.now(), lookups };
-  return lookups;
+  playlistLookupCache = { at: Date.now(), lookups, failures };
+  return playlistLookupCache;
 }
 
 // The right first step for the historical backlog: instead of searching
 // Spotify's whole catalog per song (slow, quota-hungry, and picks a version
-// you didn't choose), fetch your actual playlists once and match locally
-// against what you've already curated. A match here needs no approval —
-// it's not a new decision, just recognizing a song that's already exactly
-// where you put it. Batched the same way as gap-check (excludeIds, not
-// offset) so a large backlog shows real progress instead of one long
-// silent request.
+// you didn't choose), fetch Seen In Concert once and match locally against
+// what you've already curated there. A match here needs no approval — it's
+// not a new decision, just recognizing a song that's already exactly where
+// you put it. Deliberately scoped to Seen In Concert only — this is about
+// tying every song to a real track ID, not about which companion playlists
+// a song needs to land in (that's what gaps check handles). Batched the
+// same way as gap-check (excludeIds, not offset) so a large backlog shows
+// real progress instead of one long silent request.
 app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
   const limit = 200; // cheap per-item (local lookup + one DB write), so a bigger batch than gap-check's is fine
   const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
 
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  const targetDefs = [
-    { key: 'seen', playlistId: cfg.seen_playlist_id },
-    { key: 'wes', playlistId: cfg.wes_playlist_id },
-    { key: 'dad', playlistId: cfg.dad_playlist_id },
-  ].filter(t => t.playlistId);
-  if (!targetDefs.length) return res.status(400).json({ error: 'No playlist IDs configured in Settings.' });
+  if (!cfg.seen_playlist_id) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured in Settings.' });
+  const targetDefs = [{ key: 'seen', playlistId: cfg.seen_playlist_id }];
 
-  let lookups;
+  let lookups, playlistFailures;
   try {
-    lookups = await getCachedPlaylistLookups(targetDefs);
+    const cache = await getCachedPlaylistLookups(targetDefs);
+    lookups = cache.lookups;
+    playlistFailures = cache.failures;
   } catch (e) {
-    // This is the step that was hanging for minutes on a quota-exhausted
-    // Spotify account before finally 502ing — the retry logic itself is
-    // fixed now (fails in ~1ms instead of retrying across every page), but
-    // this catch is what actually sends you a real response instead of
-    // leaving the request to time out silently.
+    // Safety net only — getCachedPlaylistLookups now catches per-playlist
+    // failures internally, so this should only fire on something truly
+    // unexpected (e.g. the config query itself failing).
     const isQuota = e.isQuotaExceeded || /QUOTA_EXCEEDED/i.test(e.message || '');
+    const isForbidden = /"status"\s*:\s*403/.test(e.message || '');
     const guidance = isQuota
       ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
+      : isForbidden
+      ? "This usually means the connected Spotify account doesn't have permission to read one of these playlists — go to Settings and click Connect Spotify again. Make sure you actually see Spotify's permission screen this time (it should list reading your playlists, not just modifying them) — if it skips straight past without showing you anything to approve, that's the bug, not you."
       : '';
     return res.status(502).json({ error: `Couldn't read your playlists from Spotify: ${e.message}. ${guidance}` });
   }
@@ -1378,7 +1390,7 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
 
   const attemptedIds = batch.map(s => s.id);
   const processed = excludeIds.length + attemptedIds.length;
-  res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit });
+  res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit, playlistFailures });
 });
 
 app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
