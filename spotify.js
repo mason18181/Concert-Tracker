@@ -145,7 +145,7 @@ async function addTracksToPlaylist(playlistId, trackUris) {
   // Spotify caps adds at 100 URIs per call.
   for (let i = 0; i < trackUris.length; i += 100) {
     const batch = trackUris.slice(i, i + 100);
-    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/tracks`, {
+    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/items`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ uris: batch }),
@@ -158,13 +158,13 @@ async function getPlaylistTrackIds(playlistId) {
   if (!playlistId) return new Set();
   const token = await getAccessToken();
   const ids = new Set();
-  let url = `${API_BASE}/playlists/${playlistId}/tracks?fields=next,items(track(id))&limit=100`;
+  let url = `${API_BASE}/playlists/${playlistId}/items?fields=next,items(item(id))&limit=100`;
   while (url) {
     const res = await fetchSpotify(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) throw new Error(`Spotify playlist read failed: ${await res.text()}`);
     const data = await res.json();
-    for (const item of data.items || []) {
-      if (item.track && item.track.id) ids.add(item.track.id);
+    for (const entry of data.items || []) {
+      if (entry.item && entry.item.id) ids.add(entry.item.id);
     }
     url = data.next;
     if (url) await sleep(80); // small pacing between pages of a large playlist
@@ -180,19 +180,19 @@ async function getPlaylistTracksFull(playlistId) {
   if (!playlistId) return [];
   const token = await getAccessToken();
   const tracks = [];
-  let url = `${API_BASE}/playlists/${playlistId}/tracks?fields=next,items(track(id,name,artists(name),album(name,images)))&limit=100`;
+  let url = `${API_BASE}/playlists/${playlistId}/items?fields=next,items(item(id,name,artists(name),album(name,images)))&limit=100`;
   while (url) {
     const res = await fetchSpotify(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) throw new Error(`Spotify playlist read failed: ${await res.text()}`);
     const data = await res.json();
-    for (const item of data.items || []) {
-      if (!item.track) continue;
+    for (const entry of data.items || []) {
+      if (!entry.item) continue;
       tracks.push({
-        id: item.track.id,
-        name: item.track.name,
-        artists: (item.track.artists || []).map(a => a.name),
-        albumName: item.track.album ? item.track.album.name : null,
-        albumArtUrl: item.track.album && item.track.album.images && item.track.album.images[1] ? item.track.album.images[1].url : (item.track.album && item.track.album.images && item.track.album.images[0] ? item.track.album.images[0].url : null),
+        id: entry.item.id,
+        name: entry.item.name,
+        artists: (entry.item.artists || []).map(a => a.name),
+        albumName: entry.item.album ? entry.item.album.name : null,
+        albumArtUrl: entry.item.album && entry.item.album.images && entry.item.album.images[1] ? entry.item.album.images[1].url : (entry.item.album && entry.item.album.images && entry.item.album.images[0] ? entry.item.album.images[0].url : null),
       });
     }
     url = data.next;
@@ -206,10 +206,10 @@ async function removeTracksFromPlaylist(playlistId, trackUris) {
   const token = await getAccessToken();
   for (let i = 0; i < trackUris.length; i += 100) {
     const batch = trackUris.slice(i, i + 100);
-    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/tracks`, {
+    const res = await fetchSpotify(`${API_BASE}/playlists/${playlistId}/items`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tracks: batch.map(uri => ({ uri })) }),
+      body: JSON.stringify({ items: batch.map(uri => ({ uri })) }),
     });
     if (!res.ok) throw new Error(`Spotify remove-from-playlist failed: ${await res.text()}`);
   }
