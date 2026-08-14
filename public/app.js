@@ -442,15 +442,21 @@ async function renderSync() {
     el.innerHTML = '<p class="muted">Fetching your playlists (one-time, this part has no progress bar but is usually quick)...</p>';
     let excludeIds = [];
     let totalMatched = 0;
+    let playlistFailures = [];
+    const friendlyName = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
     try {
       while (true) {
         const r = await api('/api/spotify/match-from-playlists', { method: 'POST', body: { excludeIds } });
         totalMatched += r.matched;
         excludeIds = excludeIds.concat(r.attemptedIds);
+        playlistFailures = r.playlistFailures || [];
         el.innerHTML = `<p class="muted">Matched ${fmt(totalMatched)} so far — checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
         if (r.done) break;
       }
-      el.innerHTML = `<p class="success">Matched ${fmt(totalMatched)} songs directly from your playlists. Use "Search Spotify catalog" below for whatever's still unresolved.</p>`;
+      const failureHtml = playlistFailures.length
+        ? `<div style="margin-top:8px;">${playlistFailures.map(f => `<p class="error">Couldn't read ${friendlyName[f.key] || f.key}: ${f.error}</p>`).join('')}<p class="muted">Matching still ran against whichever playlists did work — this didn't block on the ones above.</p></div>`
+        : '';
+      el.innerHTML = `<p class="success">Matched ${fmt(totalMatched)} songs directly from your playlists. Use "Search Spotify catalog" below for whatever's still unresolved.</p>${failureHtml}`;
     } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
     e.target.disabled = false;
   };
@@ -532,29 +538,61 @@ async function runGapCheck() {
 // check — same approve/skip UI either way, so a match found in a past
 // interrupted run gets exactly the same review experience as one found
 // just now.
+const PLAYLIST_LABELS = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
+
 function renderAdditionsApprovalList(container, additions, append) {
   const wrap = document.createElement('div');
-  wrap.innerHTML = `
-    <div id="gap-additions">${additions.map(a => `
+
+  // Counts per playlist, for the summary + filter pills — an item can count
+  // toward more than one playlist if it applies to several companions.
+  const counts = { seen: 0, wes: 0, dad: 0 };
+  additions.forEach(a => a.targets.forEach(t => { if (counts[t] !== undefined) counts[t]++; }));
+  const filterKeys = Object.keys(counts).filter(k => counts[k] > 0);
+  let activeFilter = 'all';
+
+  function rowsHtml(list) {
+    return list.map(a => `
       <div class="song-row" data-gap-song="${a.songId}">
         <img class="art" src="${a.track.albumArtUrl || ''}" />
         <div style="flex:1;min-width:0;">
           <div>${a.title} — ${a.artist}</div>
-          <div class="muted">${a.track.albumName} &middot; will add to: ${a.targets.join(', ')}</div>
+          <div class="muted">${a.track.albumName} &middot; missing from: ${a.targets.map(t => PLAYLIST_LABELS[t] || t).join(', ')}</div>
         </div>
         <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
       </div>
-    `).join('')}</div>
+    `).join('');
+  }
+
+  wrap.innerHTML = `
+    ${filterKeys.length > 1 ? `
+      <div class="row" style="margin-bottom:10px;">
+        <button class="btn secondary filter-pill active" data-filter="all">All (${fmt(additions.length)})</button>
+        ${filterKeys.map(k => `<button class="btn secondary filter-pill" data-filter="${k}">${PLAYLIST_LABELS[k]} (${fmt(counts[k])})</button>`).join('')}
+      </div>
+    ` : ''}
+    <div id="gap-additions">${rowsHtml(additions)}</div>
     <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(additions.length)} song(s) to playlists</button>
   `;
   if (append) { container.appendChild(wrap); } else { container.innerHTML = ''; container.appendChild(wrap); }
 
   const skipped = new Set();
-  wrap.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
-    skipped.add(Number(btn.dataset.gapDrop));
-    btn.closest('.song-row').style.opacity = '0.3';
-    btn.disabled = true;
+  function wireRowButtons() {
+    wrap.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
+      skipped.add(Number(btn.dataset.gapDrop));
+      btn.closest('.song-row').style.opacity = '0.3';
+      btn.disabled = true;
+    });
+  }
+  wireRowButtons();
+
+  wrap.querySelectorAll('.filter-pill').forEach(pill => pill.onclick = () => {
+    activeFilter = pill.dataset.filter;
+    wrap.querySelectorAll('.filter-pill').forEach(p => p.classList.toggle('active', p === pill));
+    const visible = activeFilter === 'all' ? additions : additions.filter(a => a.targets.includes(activeFilter));
+    document.getElementById('gap-additions').innerHTML = rowsHtml(visible);
+    wireRowButtons();
   });
+
   wrap.querySelector('#apply-gap-additions-btn').onclick = async () => {
     const toApply = additions.filter(a => !skipped.has(a.songId));
     try {
