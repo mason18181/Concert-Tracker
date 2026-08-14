@@ -88,7 +88,7 @@ app.get('/api/spotify/diagnose-playlist', requireAuth, async (req, res) => {
       const meRes = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${token}` } });
       if (meRes.ok) {
         const me = await meRes.json();
-        result.connectedAs = { id: me.id, displayName: me.display_name, product: me.product };
+        result.connectedAs = { id: me.id, displayName: me.display_name };
       } else {
         result.connectedAsError = `${meRes.status}: ${await meRes.text()}`;
       }
@@ -111,9 +111,10 @@ app.get('/api/spotify/diagnose-playlist', requireAuth, async (req, res) => {
     // isolation — same endpoint, same fields filter, same everything the
     // real matching code uses, so if this fails we see its exact raw
     // response instead of inferring from the (different, working) metadata
-    // call above.
+    // call above. Uses the current /items endpoint — GET /tracks was
+    // renamed and removed for Development Mode apps as of March 2026.
     try {
-      const tracksUrl = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?fields=next,items(track(id,name,artists(name),album(name,images)))&limit=5`;
+      const tracksUrl = `https://api.spotify.com/v1/playlists/${playlistId}/items?fields=next,items(item(id,name,artists(name),album(name,images)))&limit=5`;
       const tracksRes = await fetch(tracksUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (tracksRes.ok) {
         const data = await tracksRes.json();
