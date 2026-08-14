@@ -106,6 +106,23 @@ app.get('/api/spotify/diagnose-playlist', requireAuth, async (req, res) => {
         result.playlistError = `${plRes.status}: ${await plRes.text()}`;
       }
     } catch (e) { result.playlistError = e.message; }
+
+    // The actual call that's been failing, tested directly and in
+    // isolation — same endpoint, same fields filter, same everything the
+    // real matching code uses, so if this fails we see its exact raw
+    // response instead of inferring from the (different, working) metadata
+    // call above.
+    try {
+      const tracksUrl = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?fields=next,items(track(id,name,artists(name),album(name,images)))&limit=5`;
+      const tracksRes = await fetch(tracksUrl, { headers: { Authorization: `Bearer ${token}` } });
+      if (tracksRes.ok) {
+        const data = await tracksRes.json();
+        result.tracksEndpointWorked = true;
+        result.sampleTrackCount = data.items ? data.items.length : 0;
+      } else {
+        result.tracksEndpointError = `${tracksRes.status}: ${await tracksRes.text()}`;
+      }
+    } catch (e) { result.tracksEndpointError = e.message; }
   } catch (e) {
     result.tokenError = e.message;
   }
