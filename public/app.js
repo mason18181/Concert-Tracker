@@ -230,7 +230,9 @@ async function renderSettings() {
       <div class="field" style="margin-top:14px;"><label>Seen In Concert playlist ID</label><input id="pl-seen" value="${s.seenPlaylistId || ''}" /></div>
       <div class="field"><label>Wes Concerts playlist ID</label><input id="pl-wes" value="${s.wesPlaylistId || ''}" /></div>
       <div class="field"><label>Concerts with Dad playlist ID</label><input id="pl-dad" value="${s.dadPlaylistId || ''}" /></div>
-      <p class="muted">Playlist ID is the string after /playlist/ in a Spotify playlist's share link.</p>
+      <p class="muted">Paste either the playlist ID or the full share link (open.spotify.com/playlist/...) — either works, it gets cleaned up automatically.</p>
+      <button class="btn secondary" id="diagnose-playlist-btn" style="margin-top:8px;">Diagnose "Seen In Concert" access</button>
+      <div id="diagnose-result" style="margin-top:8px;"></div>
     </div>
     <div class="card">
       <h2>Default travel origin</h2>
@@ -256,6 +258,23 @@ async function renderSettings() {
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
     </div>
   `;
+  document.getElementById('diagnose-playlist-btn').onclick = async () => {
+    const el = document.getElementById('diagnose-result');
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api('/api/spotify/diagnose-playlist');
+      const lines = [];
+      lines.push(`<div class="muted" style="font-size:12px;">Playlist ID being used: <span style="font-family:monospace;">${d.playlistId}</span></div>`);
+      if (d.tokenError) lines.push(`<p class="error">Couldn't get a Spotify token at all: ${d.tokenError}</p>`);
+      if (d.connectedAsError) lines.push(`<p class="error">Couldn't confirm which account we're connected as: ${d.connectedAsError}</p>`);
+      if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id}) &middot; ${d.connectedAs.product} plan</div>`);
+      if (d.playlistError) lines.push(`<p class="error">Couldn't read this playlist's info: ${d.playlistError}</p>`);
+      if (d.playlist) lines.push(`<div class="muted" style="font-size:12px;">Playlist: <b>${d.playlist.name}</b> &middot; owner: ${d.playlist.ownerName} (${d.playlist.ownerId}) &middot; ${d.playlist.public ? 'public' : 'private'}${d.playlist.collaborative ? ', collaborative' : ''}</div>`);
+      if (d.ownershipMismatch) lines.push(`<p class="error" style="margin-top:6px;"><b>Found it:</b> ${d.ownershipMismatch}</p>`);
+      else if (d.connectedAs && d.playlist) lines.push('<p class="success" style="margin-top:6px;">Ownership matches — connected account is the playlist owner.</p>');
+      el.innerHTML = lines.join('');
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
   document.getElementById('sfm-debug-btn').onclick = async () => {
     const el = document.getElementById('sfm-debug-result');
     el.innerHTML = '<p class="muted">Checking...</p>';
