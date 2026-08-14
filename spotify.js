@@ -11,6 +11,12 @@ function getAuthUrl(redirectUri, state) {
     redirect_uri: redirectUri,
     scope: 'playlist-modify-public playlist-modify-private playlist-read-private playlist-read-collaborative',
     state,
+    // Without this, Spotify may silently redirect a user who's already
+    // approved the app once, without ever showing them the new scope —
+    // meaning a scope change (like adding playlist-read-private) could
+    // look like it reconnected successfully while the token underneath
+    // still lacks the new permission. Force the consent screen every time.
+    show_dialog: 'true',
   });
   return `${ACCOUNTS_BASE}/authorize?${params.toString()}`;
 }
