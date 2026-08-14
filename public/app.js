@@ -270,6 +270,8 @@ async function renderSettings() {
       if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id}) &middot; ${d.connectedAs.product} plan</div>`);
       if (d.playlistError) lines.push(`<p class="error">Couldn't read this playlist's info: ${d.playlistError}</p>`);
       if (d.playlist) lines.push(`<div class="muted" style="font-size:12px;">Playlist: <b>${d.playlist.name}</b> &middot; owner: ${d.playlist.ownerName} (${d.playlist.ownerId}) &middot; ${d.playlist.public ? 'public' : 'private'}${d.playlist.collaborative ? ', collaborative' : ''}</div>`);
+      if (d.tracksEndpointError) lines.push(`<p class="error" style="margin-top:6px;"><b>The actual failing call, tested directly:</b> ${d.tracksEndpointError}</p>`);
+      if (d.tracksEndpointWorked) lines.push(`<p class="success" style="margin-top:6px;">The tracks endpoint worked directly (got ${d.sampleTrackCount} sample tracks) — if the real button still fails after this, it may be a transient issue, worth trying again.</p>`);
       if (d.ownershipMismatch) lines.push(`<p class="error" style="margin-top:6px;"><b>Found it:</b> ${d.ownershipMismatch}</p>`);
       else if (d.connectedAs && d.playlist) lines.push('<p class="success" style="margin-top:6px;">Ownership matches — connected account is the playlist owner.</p>');
       el.innerHTML = lines.join('');
