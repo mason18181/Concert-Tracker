@@ -47,13 +47,69 @@ app.get('/api/settings', requireAuth, async (req, res) => {
   });
 });
 
+// Accepts a bare playlist ID, a full share URL (https://open.spotify.com/
+// playlist/ID?si=...), or a spotify:playlist:ID URI — whatever format
+// Spotify's own "Copy link" gives someone — and reduces it to just the raw
+// ID our API calls actually need. Pasting the full share link (which is
+// what most people naturally copy) was silently producing malformed API
+// requests before this existed.
+function extractPlaylistId(input) {
+  if (!input) return null;
+  const trimmed = input.trim();
+  const urlMatch = trimmed.match(/playlist[/:]([a-zA-Z0-9]+)/);
+  if (urlMatch) return urlMatch[1];
+  return trimmed.split('?')[0]; // bare ID, possibly with a stray query string
+}
+
 app.post('/api/settings', requireAuth, async (req, res) => {
   const { setlistfmUsername, seenPlaylistId, wesPlaylistId, dadPlaylistId, defaultOriginAddress } = req.body;
   await pool.query(
     `UPDATE config SET setlistfm_username=$1, seen_playlist_id=$2, wes_playlist_id=$3, dad_playlist_id=$4, default_origin_address=$5 WHERE id=1`,
-    [setlistfmUsername, seenPlaylistId, wesPlaylistId, dadPlaylistId, defaultOriginAddress]
+    [setlistfmUsername, extractPlaylistId(seenPlaylistId), extractPlaylistId(wesPlaylistId), extractPlaylistId(dadPlaylistId), defaultOriginAddress]
   );
   res.json({ ok: true });
+});
+
+// Tells us definitively who the Spotify connection is authenticated as,
+// and who actually owns the configured playlist — a 403 that survives
+// correct format and correct scopes usually means one of these two doesn't
+// match what you'd expect, and this makes that visible instead of guessed.
+app.get('/api/spotify/diagnose-playlist', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
+  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
+  if (!playlistId) return res.json({ error: 'No Seen In Concert playlist ID configured.' });
+
+  const result = { playlistId };
+  try {
+    const token = await spotify.getAccessToken();
+    result.tokenObtained = true;
+
+    try {
+      const meRes = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${token}` } });
+      if (meRes.ok) {
+        const me = await meRes.json();
+        result.connectedAs = { id: me.id, displayName: me.display_name, product: me.product };
+      } else {
+        result.connectedAsError = `${meRes.status}: ${await meRes.text()}`;
+      }
+    } catch (e) { result.connectedAsError = e.message; }
+
+    try {
+      const plRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=id,name,public,collaborative,owner`, { headers: { Authorization: `Bearer ${token}` } });
+      if (plRes.ok) {
+        const pl = await plRes.json();
+        result.playlist = { name: pl.name, public: pl.public, collaborative: pl.collaborative, ownerId: pl.owner ? pl.owner.id : null, ownerName: pl.owner ? pl.owner.display_name : null };
+        if (result.connectedAs && result.playlist.ownerId && result.connectedAs.id !== result.playlist.ownerId) {
+          result.ownershipMismatch = `Connected as "${result.connectedAs.displayName}" (${result.connectedAs.id}), but this playlist is owned by "${result.playlist.ownerName}" (${result.playlist.ownerId}).`;
+        }
+      } else {
+        result.playlistError = `${plRes.status}: ${await plRes.text()}`;
+      }
+    } catch (e) { result.playlistError = e.message; }
+  } catch (e) {
+    result.tokenError = e.message;
+  }
+  res.json(result);
 });
 
 // ---------- Spotify OAuth ----------
@@ -703,7 +759,7 @@ app.post('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
         { key: 'seen', playlistId: (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0].seen_playlist_id },
       ];
       const cfg = (await pool.query('SELECT wes_playlist_id, dad_playlist_id FROM config WHERE id=1')).rows[0];
-      targets.push({ key: 'wes', playlistId: cfg.wes_playlist_id }, { key: 'dad', playlistId: cfg.dad_playlist_id });
+      targets.push({ key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) }, { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) });
       const affected = (await pool.query('SELECT id, added_to_seen, added_to_wes, added_to_dad FROM show_songs WHERE song_id=$1', [d.songId])).rows;
       for (const t of targets) {
         if (affected.some(r => r[`added_to_${t.key}`])) {
@@ -733,9 +789,9 @@ async function playlistTargets(showId) {
   const companions = (await pool.query(
     `SELECT c.name FROM companions c JOIN show_companions sc ON sc.companion_id=c.id WHERE sc.show_id=$1`, [showId]
   )).rows.map(r => r.name);
-  const targets = [{ key: 'seen', label: 'Seen In Concert', playlistId: cfg.seen_playlist_id }];
-  if (companions.includes('Wes')) targets.push({ key: 'wes', label: 'Wes Concerts', playlistId: cfg.wes_playlist_id });
-  if (companions.includes('Jeff')) targets.push({ key: 'dad', label: 'Concerts with Dad', playlistId: cfg.dad_playlist_id });
+  const targets = [{ key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) }];
+  if (companions.includes('Wes')) targets.push({ key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) });
+  if (companions.includes('Jeff')) targets.push({ key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) });
   return targets;
 }
 
@@ -1330,7 +1386,7 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
 
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   if (!cfg.seen_playlist_id) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured in Settings.' });
-  const targetDefs = [{ key: 'seen', playlistId: cfg.seen_playlist_id }];
+  const targetDefs = [{ key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) }];
 
   let lookups, playlistFailures;
   try {
@@ -1419,9 +1475,9 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
 
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   const targetDefs = [
-    { key: 'seen', playlistId: cfg.seen_playlist_id },
-    { key: 'wes', playlistId: cfg.wes_playlist_id },
-    { key: 'dad', playlistId: cfg.dad_playlist_id },
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
   ];
   const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
 
@@ -1520,9 +1576,9 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
 app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
   const targetDefs = [
-    { key: 'seen', playlistId: cfg.seen_playlist_id },
-    { key: 'wes', playlistId: cfg.wes_playlist_id },
-    { key: 'dad', playlistId: cfg.dad_playlist_id },
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
   ];
   const matched = (await pool.query(`
     SELECT s.id AS song_id, s.title, s.artist, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
@@ -1555,7 +1611,7 @@ app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
 app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
   const { additions } = req.body; // [{songId, track, targets: ['seen','wes','dad']}]
   const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  const playlistIds = { seen: cfg.seen_playlist_id, wes: cfg.wes_playlist_id, dad: cfg.dad_playlist_id };
+  const playlistIds = { seen: extractPlaylistId(cfg.seen_playlist_id), wes: extractPlaylistId(cfg.wes_playlist_id), dad: extractPlaylistId(cfg.dad_playlist_id) };
 
   const byTarget = { seen: [], wes: [], dad: [] };
   for (const a of additions || []) {
