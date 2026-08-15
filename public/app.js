@@ -267,7 +267,7 @@ async function renderSettings() {
       lines.push(`<div class="muted" style="font-size:12px;">Playlist ID being used: <span style="font-family:monospace;">${d.playlistId}</span></div>`);
       if (d.tokenError) lines.push(`<p class="error">Couldn't get a Spotify token at all: ${d.tokenError}</p>`);
       if (d.connectedAsError) lines.push(`<p class="error">Couldn't confirm which account we're connected as: ${d.connectedAsError}</p>`);
-      if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id}) &middot; ${d.connectedAs.product} plan</div>`);
+      if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id})</div>`);
       if (d.playlistError) lines.push(`<p class="error">Couldn't read this playlist's info: ${d.playlistError}</p>`);
       if (d.playlist) lines.push(`<div class="muted" style="font-size:12px;">Playlist: <b>${d.playlist.name}</b> &middot; owner: ${d.playlist.ownerName} (${d.playlist.ownerId}) &middot; ${d.playlist.public ? 'public' : 'private'}${d.playlist.collaborative ? ', collaborative' : ''}</div>`);
       if (d.tracksEndpointError) lines.push(`<p class="error" style="margin-top:6px;"><b>The actual failing call, tested directly:</b> ${d.tracksEndpointError}</p>`);
@@ -492,8 +492,10 @@ async function renderSync() {
       const d = await api('/api/spotify/match-stats');
       const statusRows = Object.entries(d.byStatus).map(([status, count]) => `<span class="pill">${status}: ${fmt(count)}</span>`).join(' ');
       el.innerHTML = `
-        <p class="muted">Of ${fmt(d.totalSongs)} songs in your dataset, <b>${fmt(d.withRealTrackId)}</b> are actually tied to a real Spotify track right now (this is the true, persisted number — not tied to any one run).</p>
+        <p class="muted">Of ${fmt(d.totalSongs)} songs you actually saw (missed/skipped-only songs excluded — see below), <b>${fmt(d.withRealTrackId)}</b> are tied to a real Spotify track right now (this is the true, persisted number — not tied to any one run).</p>
         <p class="muted">By status: ${statusRows}</p>
+        <p class="muted" style="margin-top:6px;">${fmt(d.missedOrSkippedOnlyCount)} other song(s) in your dataset were only ever missed or skipped — these never need a Spotify match, and aren't counted above.</p>
+        ${d.excludedSongs.length ? `<p class="muted" style="margin-top:6px;">Excluded song(s):</p>${d.excludedSongs.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist}</div>`).join('')}` : ''}
         ${d.recentlyMatched.length ? `<p class="muted" style="margin-top:6px;">Most recently matched:</p>${d.recentlyMatched.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist} &rarr; ${s.spotify_track_name} (${s.spotify_album_name})</div>`).join('')}` : ''}
       `;
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
