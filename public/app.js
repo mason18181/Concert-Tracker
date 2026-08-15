@@ -426,6 +426,9 @@ async function renderSync() {
       <p class="muted" style="margin-bottom:10px;"><b>Step 1, one-time:</b> matches your existing songs against what's already in your playlists — fast, no approval needed, since it's just recognizing songs you've already added.</p>
       <button class="btn secondary" id="match-playlist-btn">Match from my playlists</button>
       <div id="match-playlist-result" style="margin-top:10px;margin-bottom:16px;"></div>
+      <p class="muted" style="margin-bottom:10px;"><b>Step 1b, for leftovers:</b> for songs step 1 couldn't find an exact match for, this looks for a close (not exact) match — still scoped only to Seen In Concert, not the wider Spotify catalog. Nothing gets applied automatically; you pick the right one per song.</p>
+      <button class="btn secondary" id="fuzzy-match-btn">Fuzzy match against Seen In Concert</button>
+      <div id="fuzzy-match-result" style="margin-top:10px;margin-bottom:16px;"></div>
       <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify for anything still unresolved (new shows, or whatever step 1 didn't find), and shows everything ready for your review — approve or skip each one, then push the approved ones to your playlists in one go.</p>
       <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
@@ -434,6 +437,11 @@ async function renderSync() {
       <button class="btn secondary" id="playlist-sizes-btn" style="font-size:11px;">Check playlist read sizes (diagnostic)</button>
       <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
       <div id="playlist-sizes-result" style="margin-top:10px;"></div>
+      <div class="row" style="margin-top:8px;">
+        <input id="song-lookup-title" placeholder="Look up a song by title (e.g. Happy Trails)" style="max-width:260px;" />
+        <button class="btn secondary" id="song-lookup-btn" style="font-size:11px;">Look up song</button>
+      </div>
+      <div id="song-lookup-result" style="margin-top:10px;"></div>
     </div>
     <div class="card">
       <h2>All shows (edit)</h2>
@@ -485,6 +493,38 @@ async function renderSync() {
     } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
     e.target.disabled = false;
   };
+  document.getElementById('fuzzy-match-btn').onclick = async (e) => {
+    e.target.disabled = true;
+    const el = document.getElementById('fuzzy-match-result');
+    el.innerHTML = '<p class="muted">Comparing against Seen In Concert...</p>';
+    try {
+      const d = await api('/api/spotify/fuzzy-match-seen');
+      if (!d.results.length) {
+        el.innerHTML = `<p class="muted">No close matches found among ${fmt(d.totalUnresolved)} unresolved song(s) — these may genuinely not be in Seen In Concert yet.</p>`;
+        e.target.disabled = false;
+        return;
+      }
+      el.innerHTML = `<p class="muted">Found possible matches for ${fmt(d.withCandidates)} of ${fmt(d.totalUnresolved)} unresolved song(s) — review each below.</p>
+        <div id="fuzzy-rows">${d.results.map(r => `
+          <div class="song-row" data-fuzzy-song="${r.songId}" style="display:block;">
+            <div style="font-weight:500;">${r.title} — ${r.artist}</div>
+            <div class="row" style="margin-top:4px;">
+              ${r.candidates.map(c => `<button class="btn secondary" data-fuzzy-pick data-song-id="${r.songId}" data-candidate-key="${stashCandidate(c)}">${c.name} (${c.albumName}) — ${c.score}% match</button>`).join('')}
+            </div>
+          </div>
+        `).join('')}</div>`;
+      el.querySelectorAll('[data-fuzzy-pick]').forEach(btn => btn.onclick = async () => {
+        const songId = Number(btn.dataset.songId);
+        const track = candidateStore[btn.dataset.candidateKey];
+        btn.disabled = true;
+        try {
+          await api('/api/spotify/fuzzy-match-seen/apply', { method: 'POST', body: { songId, track } });
+          document.querySelector(`[data-fuzzy-song="${songId}"]`).innerHTML = `<span class="success" style="font-size:12px;">Matched to ${track.name}.</span>`;
+        } catch (err) { showModal(err.message, { title: 'Error' }); btn.disabled = false; }
+      });
+    } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
+    e.target.disabled = false;
+  };
   document.getElementById('gapcheck-btn').onclick = async (e) => {
     e.target.disabled = true;
     try { await runGapCheck(); } finally { e.target.disabled = false; }
@@ -523,6 +563,24 @@ async function renderSync() {
         ? `<p class="error">${r.label}: failed — ${r.error}</p>`
         : `<p class="muted">${r.label}: <b>${fmt(r.size)}</b> tracks read</p>`
       ).join('');
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
+  document.getElementById('song-lookup-btn').onclick = async () => {
+    const el = document.getElementById('song-lookup-result');
+    const title = document.getElementById('song-lookup-title').value.trim();
+    if (!title) return;
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api(`/api/songs/lookup?title=${encodeURIComponent(title)}`);
+      if (!d.songs.length) { el.innerHTML = '<p class="muted">No song records match that title.</p>'; return; }
+      el.innerHTML = d.songs.map(s => `
+        <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
+          <div><b>${s.title}</b> — ${s.artist} <span class="muted">(song id: ${s.id}, status: ${s.spotify_status})</span></div>
+          ${s.occurrences.length
+            ? s.occurrences.map(o => `<div class="muted" style="margin-left:12px;">${new Date(o.date).toLocaleDateString()}, ${o.venue} (${o.artist}) — source: ${o.setlist_source}</div>`).join('')
+            : '<div class="muted" style="margin-left:12px;">Not attached to any show right now.</div>'}
+        </div>
+      `).join('');
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
   };
   wireAllShowsBrowser();
