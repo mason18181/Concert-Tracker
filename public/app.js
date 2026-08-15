@@ -518,7 +518,7 @@ async function renderSync() {
                 <button class="btn secondary" data-fuzzy-pick data-song-id="${r.songId}" data-candidate-key="${stashCandidate(c)}">Use this</button>
               </div>
             `).join('') : '<div class="muted" style="margin-top:4px;">No close match found in Seen In Concert.</div>'}
-            <button class="btn secondary" data-fuzzy-manual="${r.songId}" data-fuzzy-title="${r.title}" data-fuzzy-artist="${r.artist}" style="margin-top:6px;font-size:11px;">Search Spotify manually</button>
+            <button class="btn secondary" data-fuzzy-manual="${r.songId}" data-fuzzy-title="${r.title}" data-fuzzy-artist="${r.artist}" style="margin-top:6px;font-size:11px;">Search within Seen In Concert</button>
             <div id="fuzzy-manual-${r.songId}"></div>
           </div>
         `).join('')}</div>`;
@@ -544,12 +544,12 @@ async function renderSync() {
         `;
         document.getElementById(`fz-go-${songId}`).onclick = async () => {
           const resultsEl = document.getElementById(`fz-results-${songId}`);
-          resultsEl.innerHTML = '<p class="muted">Searching...</p>';
+          resultsEl.innerHTML = '<p class="muted">Searching within Seen In Concert...</p>';
           const query = document.getElementById(`fz-title-${songId}`).value;
           const artist = document.getElementById(`fz-artist-${songId}`).value;
           try {
-            const results = await api('/api/spotify/search', { method: 'POST', body: { query, artist } });
-            if (!results.length) { resultsEl.innerHTML = '<p class="muted">No results.</p>'; return; }
+            const results = await api('/api/spotify/search-within-seen', { method: 'POST', body: { query, artist } });
+            if (!results.length) { resultsEl.innerHTML = '<p class="muted">No results found within Seen In Concert.</p>'; return; }
             resultsEl.innerHTML = results.slice(0, 8).map(c => `
               <div class="song-row" style="margin-top:6px;">
                 <img class="art" src="${c.albumArtUrl || ''}" />
@@ -754,7 +754,7 @@ function renderAdditionsApprovalList(container, additions, append) {
     const toApply = additions.filter(a => !skipped.has(a.songId));
     try {
       const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions: toApply } });
-      wrap.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
+      wrap.innerHTML = `<p class="success">Added ${applied.added} song(s).${applied.skippedAlreadyPresent ? ` (${applied.skippedAlreadyPresent} were already in the playlist — skipped instead of duplicated.)` : ''}</p>`;
       renderSync();
     } catch (e) { showModal(e.message, { title: 'Error' }); }
   };
