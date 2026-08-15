@@ -1468,17 +1468,41 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
 });
 
 app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
-  const byStatus = (await pool.query(`SELECT spotify_status, count(*) AS c FROM songs GROUP BY spotify_status`)).rows;
-  const withRealTrack = (await pool.query(`SELECT count(*) AS c FROM songs WHERE spotify_track_id IS NOT NULL`)).rows[0];
-  const total = (await pool.query(`SELECT count(*) AS c FROM songs`)).rows[0];
+  // Scoped to songs with at least one 'seen' occurrence — a song that's
+  // only ever been missed or skipped never needs a Spotify match at all,
+  // and counting it here (as the raw songs-table query used to) inflated
+  // "pending" with songs that don't actually need any action.
+  const byStatus = (await pool.query(`
+    SELECT s.spotify_status, count(DISTINCT s.id) AS c
+    FROM songs s JOIN show_songs ss ON ss.song_id = s.id
+    WHERE ss.status = 'seen'
+    GROUP BY s.spotify_status
+  `)).rows;
+  const totalSeen = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id WHERE ss.status = 'seen'
+  `)).rows[0];
+  const missedOrSkippedOnly = (await pool.query(`
+    SELECT count(*) AS c FROM songs s
+    WHERE NOT EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id AND ss.status = 'seen')
+      AND EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id)
+  `)).rows[0];
+  const withRealTrack = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NOT NULL
+  `)).rows[0];
   const recentlyMatched = (await pool.query(
     `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
   )).rows;
+  const excludedSongs = (await pool.query(
+    `SELECT title, artist FROM songs WHERE spotify_status='excluded' ORDER BY id DESC LIMIT 20`
+  )).rows;
   res.json({
-    totalSongs: Number(total.c),
+    totalSongs: Number(totalSeen.c),
+    missedOrSkippedOnlyCount: Number(missedOrSkippedOnly.c),
     withRealTrackId: Number(withRealTrack.c),
     byStatus: Object.fromEntries(byStatus.map(r => [r.spotify_status, Number(r.c)])),
     recentlyMatched,
+    excludedSongs,
   });
 });
 
