@@ -500,17 +500,26 @@ async function renderSync() {
     try {
       const d = await api('/api/spotify/fuzzy-match-seen');
       if (!d.results.length) {
-        el.innerHTML = `<p class="muted">No close matches found among ${fmt(d.totalUnresolved)} unresolved song(s) — these may genuinely not be in Seen In Concert yet.</p>`;
+        el.innerHTML = `<p class="muted">Nothing unresolved — everything's already matched.</p>`;
         e.target.disabled = false;
         return;
       }
-      el.innerHTML = `<p class="muted">Found possible matches for ${fmt(d.withCandidates)} of ${fmt(d.totalUnresolved)} unresolved song(s) — review each below.</p>
+      el.innerHTML = `<p class="muted">${fmt(d.withCandidates)} of ${fmt(d.totalUnresolved)} unresolved song(s) had a close match in Seen In Concert; the rest have a manual search option instead. Review each below.</p>
         <div id="fuzzy-rows">${d.results.map(r => `
-          <div class="song-row" data-fuzzy-song="${r.songId}" style="display:block;">
+          <div data-fuzzy-song="${r.songId}" style="border-bottom:1px solid var(--line);padding:8px 0;">
             <div style="font-weight:500;">${r.title} — ${r.artist}</div>
-            <div class="row" style="margin-top:4px;">
-              ${r.candidates.map(c => `<button class="btn secondary" data-fuzzy-pick data-song-id="${r.songId}" data-candidate-key="${stashCandidate(c)}">${c.name} (${c.albumName}) — ${c.score}% match</button>`).join('')}
-            </div>
+            ${r.candidates.length ? r.candidates.map(c => `
+              <div class="song-row" style="margin-top:6px;">
+                <img class="art" src="${c.albumArtUrl || ''}" />
+                <div style="flex:1;min-width:0;">
+                  <div>${c.name}</div>
+                  <div class="muted">${c.albumName} &middot; ${c.score}% title match</div>
+                </div>
+                <button class="btn secondary" data-fuzzy-pick data-song-id="${r.songId}" data-candidate-key="${stashCandidate(c)}">Use this</button>
+              </div>
+            `).join('') : '<div class="muted" style="margin-top:4px;">No close match found in Seen In Concert.</div>'}
+            <button class="btn secondary" data-fuzzy-manual="${r.songId}" data-fuzzy-title="${r.title}" data-fuzzy-artist="${r.artist}" style="margin-top:6px;font-size:11px;">Search Spotify manually</button>
+            <div id="fuzzy-manual-${r.songId}"></div>
           </div>
         `).join('')}</div>`;
       el.querySelectorAll('[data-fuzzy-pick]').forEach(btn => btn.onclick = async () => {
@@ -521,6 +530,46 @@ async function renderSync() {
           await api('/api/spotify/fuzzy-match-seen/apply', { method: 'POST', body: { songId, track } });
           document.querySelector(`[data-fuzzy-song="${songId}"]`).innerHTML = `<span class="success" style="font-size:12px;">Matched to ${track.name}.</span>`;
         } catch (err) { showModal(err.message, { title: 'Error' }); btn.disabled = false; }
+      });
+      el.querySelectorAll('[data-fuzzy-manual]').forEach(btn => btn.onclick = () => {
+        const songId = Number(btn.dataset.fuzzyManual);
+        const box = document.getElementById(`fuzzy-manual-${songId}`);
+        box.innerHTML = `
+          <div class="row" style="margin-top:6px;">
+            <input id="fz-title-${songId}" value="${btn.dataset.fuzzyTitle}" style="max-width:220px;" />
+            <input id="fz-artist-${songId}" value="${btn.dataset.fuzzyArtist}" style="max-width:180px;" />
+            <button class="btn secondary" id="fz-go-${songId}">Search Spotify</button>
+          </div>
+          <div id="fz-results-${songId}"></div>
+        `;
+        document.getElementById(`fz-go-${songId}`).onclick = async () => {
+          const resultsEl = document.getElementById(`fz-results-${songId}`);
+          resultsEl.innerHTML = '<p class="muted">Searching...</p>';
+          const query = document.getElementById(`fz-title-${songId}`).value;
+          const artist = document.getElementById(`fz-artist-${songId}`).value;
+          try {
+            const results = await api('/api/spotify/search', { method: 'POST', body: { query, artist } });
+            if (!results.length) { resultsEl.innerHTML = '<p class="muted">No results.</p>'; return; }
+            resultsEl.innerHTML = results.slice(0, 8).map(c => `
+              <div class="song-row" style="margin-top:6px;">
+                <img class="art" src="${c.albumArtUrl || ''}" />
+                <div style="flex:1;min-width:0;">
+                  <div>${c.name}</div>
+                  <div class="muted">${c.artist} &middot; ${c.albumName}</div>
+                </div>
+                <button class="btn secondary" data-fuzzy-manual-pick="${songId}" data-candidate-key="${stashCandidate(c)}">Use this</button>
+              </div>
+            `).join('');
+            resultsEl.querySelectorAll('[data-fuzzy-manual-pick]').forEach(pickBtn => pickBtn.onclick = async () => {
+              const track = candidateStore[pickBtn.dataset.candidateKey];
+              pickBtn.disabled = true;
+              try {
+                await api('/api/spotify/fuzzy-match-seen/apply', { method: 'POST', body: { songId, track } });
+                document.querySelector(`[data-fuzzy-song="${songId}"]`).innerHTML = `<span class="success" style="font-size:12px;">Matched to ${track.name}.</span>`;
+              } catch (err) { showModal(err.message, { title: 'Error' }); pickBtn.disabled = false; }
+            });
+          } catch (err) { resultsEl.innerHTML = `<p class="error">${err.message}</p>`; }
+        };
       });
     } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
     e.target.disabled = false;
@@ -757,7 +806,10 @@ async function wireAllShowsBrowser() {
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
     listEl.innerHTML = (attendedError ? `<p class="error" style="font-size:12px;">setlist.fm check: ${attendedError}</p>` : '') + (rows.slice(0, 100).map(s => `
       <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
-        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
+        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span>
+          ${s.unmatchedCount ? ` <span class="pill" style="color:var(--danger);border-color:var(--danger);">${s.unmatchedCount} not matched</span>` : ''}
+          ${s.notAddedCount ? ` <span class="pill" style="color:var(--amber);border-color:var(--amber);">${s.notAddedCount} not in playlist</span>` : ''}
+        </div>
         ${s.artists.map(artistBadge).join('')}
         <button class="btn secondary" data-edit-show="${s.id}" style="margin-top:4px;">Edit</button>
         <button class="btn danger" data-delete-show="${s.id}" style="margin-top:4px;">Delete</button>
