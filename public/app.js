@@ -1,1546 +1,1804 @@
-let hostPw = sessionStorage.getItem('ct_pw') || null;
-let activeTab = 'sync';
-let wizardShowId = null;
-let wizardStage = null; // 'tag' | 'spotify' | 'playlist'
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const { pool, initSchema, artistKey } = require('./db');
+const setlistfm = require('./setlistfm');
+const spotify = require('./spotify');
+const ors = require('./ors');
+const { findOrCreateSong } = require('./matching');
+const { normalizeTitle } = require('./normalize');
 
-let dashboardSubtab = 'overview'; // overview | trends | travel | superlatives | journey | unknowns
-let selectedCompanionIds = new Set(); // empty == "All"
-let allCompanions = [];
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Track candidates get referenced by key instead of embedding their JSON
-// directly in HTML attributes — any apostrophe in an artist/album/track name
-// (extremely common: "Guns N' Roses", "Don't...", etc.) breaks a
-// single-quoted HTML attribute, so this sidesteps that whole class of bug.
-let candidateStore = {};
-let candidateKeyCounter = 0;
-function stashCandidate(candidate) {
-  const key = `c${candidateKeyCounter++}`;
-  candidateStore[key] = candidate;
-  return key;
-}
-function fmt(n) {
-  if (n === null || n === undefined) return '0';
-  return Number(n).toLocaleString('en-US');
-}
-let copyableCounter = 0;
-function copyableBlock(text, cssClass) {
-  const id = `copyable-${copyableCounter++}`;
-  return `<p class="${cssClass}" id="${id}">${text} <button class="btn secondary" data-copy-target="${id}" style="font-size:10px;padding:2px 8px;">Copy</button></p>`;
-}
-document.addEventListener('click', e => {
-  const btn = e.target.closest('[data-copy-target]');
-  if (!btn) return;
-  const el = document.getElementById(btn.dataset.copyTarget);
-  const text = el.textContent.replace(/Copy\s*$/, '').trim();
-  const showCopied = () => {
-    const original = btn.textContent;
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = original; }, 1500);
-  };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(showCopied).catch(() => {
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      window.getSelection().removeAllRanges();
-      window.getSelection().addRange(range);
-    });
-  } else {
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    window.getSelection().removeAllRanges();
-    window.getSelection().addRange(range);
-  }
+// Without this, an uncaught error in ANY single route (like the reset-stage
+// bug that just caused a crash loop) kills the entire Node process — every
+// user, every request, until Railway restarts it. This converts that into
+// a logged error instead, so one bad request can only ever fail itself.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (request likely hung, but server stayed up):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (server stayed up):', err);
 });
 
-const DASHBOARD_SUBTABS = [
-  ['overview', 'Overview'],
-  ['trends', 'Trends'],
-  ['travel', 'Travel'],
-  ['superlatives', 'Superlatives'],
-  ['journey', 'Journey'],
-  ['unknowns', 'Unknowns'],
-  ['spotifygaps', 'Spotify Gaps'],
-];
-
-function companionsQuery() {
-  return selectedCompanionIds.size ? `?companions=${[...selectedCompanionIds].join(',')}` : '';
+function requireAuth(req, res, next) {
+  const pw = req.header('x-host-password');
+  if (!process.env.HOST_PASSWORD) return res.status(500).json({ error: 'HOST_PASSWORD not configured on server' });
+  if (pw !== process.env.HOST_PASSWORD) return res.status(401).json({ error: 'Invalid password' });
+  next();
 }
 
-function showModal(message, { title = '', okLabel = 'Okay' } = {}) {
-  const modal = document.createElement('div');
-  modal.className = 'modal-overlay';
-  modal.innerHTML = `
-    <div class="modal-box">
-      ${title ? `<h2>${title}</h2>` : ''}
-      <p>${message}</p>
-      <button class="btn" id="modal-ok-btn">${okLabel}</button>
-    </div>
-  `;
-  document.body.appendChild(modal);
-  modal.querySelector('#modal-ok-btn').onclick = () => modal.remove();
-  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-}
+app.post('/api/login', requireAuth, (req, res) => res.json({ ok: true }));
 
-const app = document.getElementById('app');
-const nav = document.getElementById('nav');
-
-async function api(path, { method = 'GET', body } = {}) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (hostPw) headers['x-host-password'] = hostPw;
-  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Request failed');
-  return data;
-}
-
-nav.addEventListener('click', e => {
-  const btn = e.target.closest('button[data-tab]');
-  if (!btn) return;
-  activeTab = btn.dataset.tab;
-  wizardShowId = null;
-  renderTab();
+// ---------- settings ----------
+app.get('/api/settings', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  res.json({
+    setlistfmUsername: cfg.setlistfm_username,
+    spotifyConnected: !!cfg.spotify_refresh_token,
+    seenPlaylistId: cfg.seen_playlist_id,
+    wesPlaylistId: cfg.wes_playlist_id,
+    dadPlaylistId: cfg.dad_playlist_id,
+    defaultOriginAddress: cfg.default_origin_address,
+    lastSyncedAt: cfg.last_synced_at,
+  });
 });
 
-async function loadCompanionsForFilter() {
-  allCompanions = await api('/api/companions');
+// Accepts a bare playlist ID, a full share URL (https://open.spotify.com/
+// playlist/ID?si=...), or a spotify:playlist:ID URI — whatever format
+// Spotify's own "Copy link" gives someone — and reduces it to just the raw
+// ID our API calls actually need. Pasting the full share link (which is
+// what most people naturally copy) was silently producing malformed API
+// requests before this existed.
+function extractPlaylistId(input) {
+  if (!input) return null;
+  const trimmed = input.trim();
+  const urlMatch = trimmed.match(/playlist[/:]([a-zA-Z0-9]+)/);
+  if (urlMatch) return urlMatch[1];
+  return trimmed.split('?')[0]; // bare ID, possibly with a stray query string
 }
 
-function renderAttendeeFilterBar() {
-  const allActive = selectedCompanionIds.size === 0;
-  return `
-    <div class="card filter-bar">
-      <div class="row" style="align-items:center;">
-        <span class="muted" style="text-transform:uppercase;font-size:11px;">Attendee:</span>
-        <span class="pill ${allActive ? 'on' : ''}" data-attendee="all">All</span>
-        ${allCompanions.map(c => `<span class="pill ${selectedCompanionIds.has(c.id) ? 'on' : ''}" data-attendee="${c.id}">${c.name}</span>`).join('')}
-      </div>
-    </div>
-  `;
-}
+app.post('/api/settings', requireAuth, async (req, res) => {
+  const { setlistfmUsername, seenPlaylistId, wesPlaylistId, dadPlaylistId, defaultOriginAddress } = req.body;
+  await pool.query(
+    `UPDATE config SET setlistfm_username=$1, seen_playlist_id=$2, wes_playlist_id=$3, dad_playlist_id=$4, default_origin_address=$5 WHERE id=1`,
+    [setlistfmUsername, extractPlaylistId(seenPlaylistId), extractPlaylistId(wesPlaylistId), extractPlaylistId(dadPlaylistId), defaultOriginAddress]
+  );
+  res.json({ ok: true });
+});
 
-function wireAttendeeFilterBar(onChange) {
-  app.querySelectorAll('[data-attendee]').forEach(p => {
-    p.onclick = () => {
-      if (p.dataset.attendee === 'all') {
-        selectedCompanionIds.clear();
-      } else {
-        const id = Number(p.dataset.attendee);
-        if (selectedCompanionIds.has(id)) selectedCompanionIds.delete(id);
-        else selectedCompanionIds.add(id);
-      }
-      onChange();
-    };
-  });
-}
+// Tells us definitively who the Spotify connection is authenticated as,
+// and who actually owns the configured playlist — a 403 that survives
+// correct format and correct scopes usually means one of these two doesn't
+// match what you'd expect, and this makes that visible instead of guessed.
+app.get('/api/spotify/diagnose-playlist', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
+  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
+  if (!playlistId) return res.json({ error: 'No Seen In Concert playlist ID configured.' });
 
-function renderDashboardSubnav() {
-  return `
-    <div class="row subnav">
-      ${DASHBOARD_SUBTABS.map(([key, label]) => `<button class="btn secondary sub-tab-btn ${dashboardSubtab === key ? 'active' : ''}" data-subtab="${key}">${label}</button>`).join('')}
-    </div>
-  `;
-}
-
-function wireDashboardSubnav() {
-  app.querySelectorAll('[data-subtab]').forEach(btn => {
-    btn.onclick = () => { dashboardSubtab = btn.dataset.subtab; renderDashboard(); };
-  });
-}
-
-async function renderDashboard() {
-  if (!allCompanions.length) await loadCompanionsForFilter();
-  const renderers = {
-    overview: renderOverview,
-    trends: renderTrends,
-    travel: renderTravel,
-    superlatives: renderSuperlatives,
-    journey: renderJourney,
-    unknowns: renderUnknowns,
-    spotifygaps: renderSpotifyGaps,
-  };
-  app.innerHTML = `<div id="dash-subnav-slot"></div><div id="dash-filter-slot"></div><div id="dash-body-slot"></div>`;
-  document.getElementById('dash-subnav-slot').innerHTML = renderDashboardSubnav();
-  document.getElementById('dash-filter-slot').innerHTML = renderAttendeeFilterBar();
-  wireDashboardSubnav();
-  wireAttendeeFilterBar(renderDashboard);
-  await renderers[dashboardSubtab]();
-}
-
-function setNavActive() {
-  [...nav.querySelectorAll('button')].forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
-}
-
-async function boot() {
-  if (!hostPw) { renderLoginGate(); return; }
-  try { await api('/api/login', { method: 'POST' }); }
-  catch (e) { hostPw = null; sessionStorage.removeItem('ct_pw'); renderLoginGate(); return; }
-  nav.classList.remove('hidden');
-  renderTab();
-}
-
-function renderLoginGate() {
-  nav.classList.add('hidden');
-  app.innerHTML = `
-    <div class="card" style="max-width:380px;margin:60px auto;">
-      <h1>Concert Tracker</h1>
-      <div class="field"><label>Password</label><input id="pw" type="password" /></div>
-      <button class="btn" id="login-btn">Unlock</button>
-      <div class="error" id="login-err"></div>
-    </div>`;
-  document.getElementById('login-btn').onclick = async () => {
-    hostPw = document.getElementById('pw').value;
-    try {
-      await api('/api/login', { method: 'POST' });
-      sessionStorage.setItem('ct_pw', hostPw);
-      nav.classList.remove('hidden');
-      renderTab();
-    } catch (e) { document.getElementById('login-err').textContent = e.message; }
-  };
-}
-
-function renderTab() {
-  setNavActive();
-  candidateStore = {};
-  if (wizardShowId) return renderWizard();
-  if (activeTab === 'sync') return renderSync();
-  if (activeTab === 'dashboard') return renderDashboard();
-  if (activeTab === 'settings') return renderSettings();
-}
-
-function dashBody() { return document.getElementById('dash-body-slot'); }
-
-// ---------------- Settings ----------------
-async function renderSettings() {
-  const s = await api('/api/settings');
-  app.innerHTML = `
-    <div class="card">
-      <h2>setlist.fm</h2>
-      <div class="field"><label>Username</label><input id="sfm-user" value="${s.setlistfmUsername || ''}" /></div>
-      <button class="btn secondary" id="sfm-debug-btn" style="margin-top:8px;">Test attendance check</button>
-      <div class="row" style="margin-top:8px;">
-        <input id="sfm-debug-artist" placeholder="Look up a specific artist (e.g. Lynyrd Skynyrd)" style="max-width:260px;" />
-        <button class="btn secondary" id="sfm-debug-lookup-btn">Look up</button>
-      </div>
-      <div id="sfm-debug-result" style="margin-top:8px;"></div>
-    </div>
-    <div class="card">
-      <h2>Spotify</h2>
-      <p class="${s.spotifyConnected ? 'success' : 'muted'}">${s.spotifyConnected ? 'Connected' : 'Not connected yet'}</p>
-      <button class="btn secondary" id="spotify-connect-btn">Connect Spotify</button>
-      <div class="field" style="margin-top:14px;"><label>Seen In Concert playlist ID</label><input id="pl-seen" value="${s.seenPlaylistId || ''}" /></div>
-      <div class="field"><label>Wes Concerts playlist ID</label><input id="pl-wes" value="${s.wesPlaylistId || ''}" /></div>
-      <div class="field"><label>Concerts with Dad playlist ID</label><input id="pl-dad" value="${s.dadPlaylistId || ''}" /></div>
-      <p class="muted">Paste either the playlist ID or the full share link (open.spotify.com/playlist/...) — either works, it gets cleaned up automatically.</p>
-      <button class="btn secondary" id="diagnose-playlist-btn" style="margin-top:8px;">Diagnose "Seen In Concert" access</button>
-      <div id="diagnose-result" style="margin-top:8px;"></div>
-    </div>
-    <div class="card">
-      <h2>Default travel origin</h2>
-      <div class="field"><label>Home address</label><input id="origin" value="${s.defaultOriginAddress || ''}" /></div>
-    </div>
-    <button class="btn" id="save-settings-btn">Save settings</button>
-    <div class="success" id="settings-ok"></div>
-    <div class="card" style="margin-top:20px;">
-      <h2>Historical import</h2>
-      <p class="muted">Loads your 59 historical shows into the database. Safe to click more than once — already-imported shows are skipped for songs/companions, but this also retries travel geocoding for any of them still missing miles/time, so it doubles as the fix for a straggler like a venue that failed to geocode the first time.</p>
-      <button class="btn secondary" id="import-btn">Run historical import</button>
-      <div class="muted" id="import-status" style="margin-top:8px;"></div>
-    </div>
-    <div class="card">
-      <h2>Match historical shows to setlist.fm</h2>
-      <p class="muted">Finds the real setlist.fm entry for each historical show (by artist + exact date) and fills in the tour name. This reads public setlist.fm data only — it can't mark "I Was There" on your account, since that's a website-only action with no API equivalent. Safe to click more than once.</p>
-      <button class="btn secondary" id="match-sfm-btn">Match to setlist.fm</button>
-      <div class="muted" id="match-sfm-status" style="margin-top:8px;"></div>
-    </div>
-    <div class="card">
-      <h2>Session</h2>
-      <button class="btn danger" id="lock-btn">Lock app</button>
-      <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
-    </div>
-  `;
-  document.getElementById('diagnose-playlist-btn').onclick = async () => {
-    const el = document.getElementById('diagnose-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/diagnose-playlist');
-      const lines = [];
-      lines.push(`<div class="muted" style="font-size:12px;">Playlist ID being used: <span style="font-family:monospace;">${d.playlistId}</span></div>`);
-      if (d.tokenError) lines.push(`<p class="error">Couldn't get a Spotify token at all: ${d.tokenError}</p>`);
-      if (d.connectedAsError) lines.push(`<p class="error">Couldn't confirm which account we're connected as: ${d.connectedAsError}</p>`);
-      if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id})</div>`);
-      if (d.playlistError) lines.push(`<p class="error">Couldn't read this playlist's info: ${d.playlistError}</p>`);
-      if (d.playlist) lines.push(`<div class="muted" style="font-size:12px;">Playlist: <b>${d.playlist.name}</b> &middot; owner: ${d.playlist.ownerName} (${d.playlist.ownerId}) &middot; ${d.playlist.public ? 'public' : 'private'}${d.playlist.collaborative ? ', collaborative' : ''}</div>`);
-      if (d.tracksEndpointError) lines.push(`<p class="error" style="margin-top:6px;"><b>The actual failing call, tested directly:</b> ${d.tracksEndpointError}</p>`);
-      if (d.tracksEndpointWorked) lines.push(`<p class="success" style="margin-top:6px;">The tracks endpoint worked directly (got ${d.sampleTrackCount} sample tracks) — if the real button still fails after this, it may be a transient issue, worth trying again.</p>`);
-      if (d.ownershipMismatch) lines.push(`<p class="error" style="margin-top:6px;"><b>Found it:</b> ${d.ownershipMismatch}</p>`);
-      else if (d.connectedAs && d.playlist) lines.push('<p class="success" style="margin-top:6px;">Ownership matches — connected account is the playlist owner.</p>');
-      el.innerHTML = lines.join('');
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  document.getElementById('sfm-debug-btn').onclick = async () => {
-    const el = document.getElementById('sfm-debug-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/setlistfm/attended-debug');
-      if (d.error) { el.innerHTML = `<p class="error">${d.error}</p>`; return; }
-      const matchedIds = new Set(d.matchedShows.map(m => m.setlistfm_id));
-      const overlap = d.attendedSample.filter(a => matchedIds.has(a.id));
-      el.innerHTML = `
-        <p class="muted">Username used: <b>${d.username}</b> &middot; attended shows fetched: <b>${fmt(d.attendedCount)}</b> &middot; shows matched in your dataset: <b>${fmt(d.matchedShows.length)}</b></p>
-        <p class="muted">First few attended (raw from setlist.fm):</p>
-        ${d.attendedSample.map(a => `<div class="muted" style="font-size:12px;">${a.date} — ${a.artist} @ ${a.venue} <span style="font-family:monospace;">(id: ${a.id})</span></div>`).join('')}
-        <p class="muted" style="margin-top:8px;">Your dataset's matched show IDs (first 10):</p>
-        ${d.matchedShows.slice(0, 10).map(m => `<div class="muted" style="font-size:12px;">${m.artist} <span style="font-family:monospace;">(id: ${m.setlistfm_id})</span></div>`).join('')}
-        <p style="margin-top:8px;" class="${overlap.length ? 'success' : 'error'}">Overlap found in this sample: ${overlap.length}</p>
-      `;
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  document.getElementById('sfm-debug-lookup-btn').onclick = async () => {
-    const el = document.getElementById('sfm-debug-result');
-    const artist = document.getElementById('sfm-debug-artist').value.trim();
-    if (!artist) return;
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api(`/api/setlistfm/attended-debug?artist=${encodeURIComponent(artist)}`);
-      if (d.error) { el.innerHTML = `<p class="error">${d.error}</p>`; return; }
-      if (!d.artistLookup.length) { el.innerHTML = '<p class="muted">No show_artists rows match that name.</p>'; return; }
-      el.innerHTML = d.artistLookup.map(r => `
-        <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
-          <div>${r.artist} — ${new Date(r.date).toLocaleDateString()}, ${r.venue}</div>
-          <div class="muted">checked: ${r.setlistfm_checked} &middot; setlistfm_id: ${r.setlistfm_id || 'none'} &middot; url: ${r.setlistfm_url ? 'yes' : 'none'} &middot; marked_attended (override flag): ${r.marked_attended}</div>
-        </div>
-      `).join('');
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  document.getElementById('import-btn').onclick = async () => {
-    const statusEl = document.getElementById('import-status');
-    statusEl.textContent = 'Running — this can take a minute or two...';
-    try {
-      const r = await api('/api/import/historical', { method: 'POST' });
-      statusEl.innerHTML = `Imported ${r.imported} new show(s). ${r.skipped} already existed, of which ${r.geoFilled} had missing travel data filled in and ${r.artistsAdded} had a new artist added.` +
-        (r.geoFailures.length ? `<div style="margin-top:8px;">${r.geoFailures.map(f => `<div class="error">${f.venue} (${new Date(f.date).toLocaleDateString()}): ${f.reason}</div>`).join('')}</div>` : '');
-    } catch (e) { statusEl.textContent = e.message; }
-  };
-  document.getElementById('match-sfm-btn').onclick = async () => {
-    const statusEl = document.getElementById('match-sfm-status');
-    statusEl.textContent = 'Starting...';
-    let totalMatched = 0, totalNoMatch = 0, allUnmatched = [];
-    try {
-      while (true) {
-        const r = await api('/api/setlistfm/match-historical', { method: 'POST' });
-        totalMatched += r.matched;
-        totalNoMatch += r.noMatch;
-        allUnmatched = allUnmatched.concat(r.unmatched);
-        statusEl.textContent = `Matched ${fmt(totalMatched)}, no match for ${fmt(totalNoMatch)}. ${fmt(r.remaining)} remaining...`;
-        if (r.done) break;
-      }
-      statusEl.innerHTML = `Done — matched ${fmt(totalMatched)} show(s), no automatic match for ${fmt(totalNoMatch)}. Usually an opener whose setlist was never logged separately, or a name that doesn't exactly match setlist.fm's listing — search manually below.`;
-      renderUnmatchedList(allUnmatched);
-    } catch (e) { statusEl.textContent = e.message; }
-  };
-  document.getElementById('spotify-connect-btn').onclick = async () => {
-    const { url } = await api('/api/spotify/connect');
-    window.open(url, '_blank');
-  };
-  document.getElementById('save-settings-btn').onclick = async () => {
-    await api('/api/settings', { method: 'POST', body: {
-      setlistfmUsername: document.getElementById('sfm-user').value,
-      seenPlaylistId: document.getElementById('pl-seen').value,
-      wesPlaylistId: document.getElementById('pl-wes').value,
-      dadPlaylistId: document.getElementById('pl-dad').value,
-      defaultOriginAddress: document.getElementById('origin').value,
-    }});
-    document.getElementById('settings-ok').textContent = 'Saved.';
-  };
-  document.getElementById('lock-btn').onclick = () => {
-    hostPw = null;
-    sessionStorage.removeItem('ct_pw');
-    renderLoginGate();
-  };
-}
-
-function renderUnmatchedList(unmatched) {
-  const container = document.createElement('div');
-  container.id = 'sfm-unmatched-list';
-  container.style.marginTop = '10px';
-  document.getElementById('match-sfm-status').after(container);
-  container.innerHTML = unmatched.map(u => `
-    <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-unmatched-row="${u.id}">
-      <div class="row" style="justify-content:space-between;">
-        <span>${u.artist} — ${new Date(u.date).toLocaleDateString()}, ${u.venue}</span>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <input class="sfm-manual-name" value="${u.artist}" style="max-width:200px;" />
-        <input class="sfm-manual-date" type="date" value="${new Date(u.date).toISOString().slice(0,10)}" style="max-width:150px;" title="Clear this to search without a date filter" />
-        <button class="btn secondary" data-manual-search-btn="${u.id}">Search setlist.fm</button>
-      </div>
-      <div id="sfm-manual-results-${u.id}"></div>
-    </div>
-  `).join('');
-  container.querySelectorAll('[data-manual-search-btn]').forEach(btn => btn.onclick = async () => {
-    const row = btn.closest('[data-unmatched-row]');
-    const name = row.querySelector('.sfm-manual-name').value.trim();
-    const dateVal = row.querySelector('.sfm-manual-date').value; // may be cleared on purpose
-    const resultsEl = document.getElementById(`sfm-manual-results-${btn.dataset.manualSearchBtn}`);
-    resultsEl.innerHTML = '<p class="muted">Searching...</p>';
-    try {
-      const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: dateVal || null } });
-      if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results — try clearing the date, or double-check the spelling matches setlist.fm exactly.</p>'; return; }
-      resultsEl.innerHTML = candidates.map(c => `
-        <div class="row" style="justify-content:space-between;padding:4px 0;">
-          <span class="muted">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
-          <button class="btn secondary" data-pick-setlist="${c.id}">Use this</button>
-        </div>
-      `).join('');
-      resultsEl.querySelectorAll('[data-pick-setlist]').forEach(pickBtn => pickBtn.onclick = async () => {
-        pickBtn.disabled = true;
-        pickBtn.textContent = 'Saving...';
-        try {
-          await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(btn.dataset.manualSearchBtn), setlistId: pickBtn.dataset.pickSetlist } });
-          row.innerHTML = `<span class="success">Saved — this show is now matched.</span>`;
-        } catch (e) { showModal(e.message, { title: 'Error' }); pickBtn.disabled = false; pickBtn.textContent = 'Use this'; }
-      });
-    } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
-  });
-}
-
-// ---------------- Sync ----------------
-async function renderSync() {
-  const pending = await api('/api/shows/pending');
-  app.innerHTML = `
-    <div class="card">
-      <h2>Sync</h2>
-      <button class="btn" id="sync-btn">Check for new shows</button>
-      <div class="muted" id="sync-status" style="margin-top:8px;"></div>
-      <div id="pending-list" style="margin-top:12px;">
-        ${pending.length ? pending.map(s => `
-          <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0;">
-            <div><b>${new Date(s.date).toLocaleDateString()}</b> — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
-            <button class="btn secondary" data-show="${s.id}" data-stage="${s.stage === 'new' ? 'tag' : s.stage === 'tagged' ? 'spotify' : 'playlist'}">Continue</button>
-          </div>
-        `).join('') : '<p class="muted">Nothing pending.</p>'}
-      </div>
-    </div>
-    <div class="card">
-      <h2>Spotify matching</h2>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 1, one-time:</b> matches your existing songs against what's already in your playlists — fast, no approval needed, since it's just recognizing songs you've already added.</p>
-      <button class="btn secondary" id="match-playlist-btn">Match from my playlists</button>
-      <div id="match-playlist-result" style="margin-top:10px;margin-bottom:16px;"></div>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify for anything still unresolved (new shows, or whatever step 1 didn't find), and shows everything ready for your review — approve or skip each one, then push the approved ones to your playlists in one go.</p>
-      <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
-      <div id="gapcheck-results" style="margin-top:12px;"></div>
-      <div class="divider" style="margin:16px 0;"></div>
-      <button class="btn secondary" id="gapcheck-stats-btn" style="font-size:11px;">Check current match status (diagnostic)</button>
-      <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
-    </div>
-    <div class="card">
-      <h2>All shows (edit)</h2>
-      <p class="muted" style="margin-bottom:10px;">Fix a mistake on any show, complete or not — reopens tagging, then Spotify review, then playlists, same as normal.</p>
-      <input id="all-shows-filter" placeholder="Filter by date or venue..." style="margin-bottom:10px;" />
-      <div id="all-shows-list"></div>
-    </div>
-  `;
-  document.getElementById('sync-btn').onclick = async () => {
-    const statusEl = document.getElementById('sync-status');
-    statusEl.textContent = 'Syncing...';
-    try {
-      const r = await api('/api/sync', { method: 'POST' });
-      await renderSync(); // refresh the list first — grabbing a fresh status element after, since the old one just got replaced
-      const freshStatusEl = document.getElementById('sync-status');
-      if (r.newShows === 0) {
-        showModal('No new shows detected.');
-      } else {
-        freshStatusEl.textContent = `Found ${r.newShows} new show(s).`;
-      }
-    } catch (e) { statusEl.textContent = e.message; }
-  };
-  app.querySelectorAll('[data-show]').forEach(btn => {
-    btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
-  });
-  document.getElementById('match-playlist-btn').onclick = async (e) => {
-    e.target.disabled = true;
-    const el = document.getElementById('match-playlist-result');
-    el.innerHTML = '<p class="muted">Fetching your playlists (one-time, this part has no progress bar but is usually quick)...</p>';
-    let excludeIds = [];
-    let totalMatched = 0;
-    let playlistFailures = [];
-    const friendlyName = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
-    try {
-      while (true) {
-        const r = await api('/api/spotify/match-from-playlists', { method: 'POST', body: { excludeIds } });
-        totalMatched += r.matched;
-        excludeIds = excludeIds.concat(r.attemptedIds);
-        playlistFailures = r.playlistFailures || [];
-        el.innerHTML = `<p class="muted">Matched ${fmt(totalMatched)} so far — checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
-        if (r.done) break;
-      }
-      const failureHtml = playlistFailures.length
-        ? `<div style="margin-top:8px;">${playlistFailures.map(f => `<p class="error">Couldn't read ${friendlyName[f.key] || f.key}: ${f.error}</p>`).join('')}<p class="muted">Matching still ran against whichever playlists did work — this didn't block on the ones above.</p></div>`
-        : '';
-      el.innerHTML = `<p class="success">Matched ${fmt(totalMatched)} songs directly from your playlists. Use "Search Spotify catalog" below for whatever's still unresolved.</p>${failureHtml}`;
-    } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
-    e.target.disabled = false;
-  };
-  document.getElementById('gapcheck-btn').onclick = async (e) => {
-    e.target.disabled = true;
-    try { await runGapCheck(); } finally { e.target.disabled = false; }
-  };
-  document.getElementById('gapcheck-stats-btn').onclick = async () => {
-    const el = document.getElementById('gapcheck-stats-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/match-stats');
-      const statusRows = Object.entries(d.byStatus).map(([status, count]) => `<span class="pill">${status}: ${fmt(count)}</span>`).join(' ');
-      el.innerHTML = `
-        <p class="muted">Of ${fmt(d.totalSongs)} songs you actually saw (missed/skipped-only songs excluded — see below), <b>${fmt(d.withRealTrackId)}</b> are tied to a real Spotify track right now (this is the true, persisted number — not tied to any one run).</p>
-        <p class="muted">By status: ${statusRows}</p>
-        <p class="muted" style="margin-top:6px;">${fmt(d.missedOrSkippedOnlyCount)} other song(s) in your dataset were only ever missed or skipped — these never need a Spotify match, and aren't counted above.</p>
-        ${d.excludedSongs.length ? `<p class="muted" style="margin-top:6px;">Excluded song(s):</p>${d.excludedSongs.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist}</div>`).join('')}` : ''}
-        ${d.recentlyMatched.length ? `<p class="muted" style="margin-top:6px;">Most recently matched:</p>${d.recentlyMatched.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist} &rarr; ${s.spotify_track_name} (${s.spotify_album_name})</div>`).join('')}` : ''}
-      `;
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  wireAllShowsBrowser();
-}
-
-async function runGapCheck() {
-  const resultsEl = document.getElementById('gapcheck-results');
-  resultsEl.innerHTML = '<p class="muted">Checking for songs already matched but not yet added...</p>';
-  let excludeIds = [];
-  let totalAutoMarked = 0;
-  let allAdditions = [];
-  let totalNoCandidates = 0;
-
-  // Anything already matched (from this run or a past interrupted one) that
-  // hasn't been pushed to a playlist yet — surfaced here first so nothing
-  // found before ever gets lost or requires a separate button to see.
+  const result = { playlistId };
   try {
-    const pending = await api('/api/spotify/pending-additions');
-    allAdditions = allAdditions.concat(pending.pending);
-  } catch (e) { /* non-fatal — still proceed to the catalog search */ }
+    const token = await spotify.getAccessToken();
+    result.tokenObtained = true;
 
-  resultsEl.innerHTML = '<p class="muted">Searching Spotify for anything still unresolved...</p>';
-  try {
-    while (true) {
-      const r = await api(`/api/spotify/gap-check?excludeIds=${excludeIds.join(',')}`);
-      totalAutoMarked += r.autoMarked;
-      allAdditions = allAdditions.concat(r.needsAddition);
-      totalNoCandidates += r.noCandidates;
-      excludeIds = excludeIds.concat(r.attemptedIds);
-      if (r.stoppedEarly) {
-        const isQuota = /QUOTA_EXCEEDED/i.test(r.searchErrorMessage || '');
-        const guidance = isQuota
-          ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
-          : 'This usually means the Spotify connection needs to be redone (Settings → Connect Spotify).';
-        resultsEl.innerHTML = copyableBlock(`Search stopped partway — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.`, 'error');
-        if (allAdditions.length) {
-          const wrap = document.createElement('div');
-          wrap.innerHTML = `<p class="muted" style="margin-top:10px;">Even though the search stopped early, ${fmt(allAdditions.length)} song(s) are still ready to review below.</p>`;
-          resultsEl.appendChild(wrap);
-          renderAdditionsApprovalList(resultsEl, allAdditions, true);
+    try {
+      const meRes = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${token}` } });
+      if (meRes.ok) {
+        const me = await meRes.json();
+        result.connectedAs = { id: me.id, displayName: me.display_name };
+      } else {
+        result.connectedAsError = `${meRes.status}: ${await meRes.text()}`;
+      }
+    } catch (e) { result.connectedAsError = e.message; }
+
+    try {
+      const plRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=id,name,public,collaborative,owner`, { headers: { Authorization: `Bearer ${token}` } });
+      if (plRes.ok) {
+        const pl = await plRes.json();
+        result.playlist = { name: pl.name, public: pl.public, collaborative: pl.collaborative, ownerId: pl.owner ? pl.owner.id : null, ownerName: pl.owner ? pl.owner.display_name : null };
+        if (result.connectedAs && result.playlist.ownerId && result.connectedAs.id !== result.playlist.ownerId) {
+          result.ownershipMismatch = `Connected as "${result.connectedAs.displayName}" (${result.connectedAs.id}), but this playlist is owned by "${result.playlist.ownerName}" (${result.playlist.ownerId}).`;
         }
-        return;
+      } else {
+        result.playlistError = `${plRes.status}: ${await plRes.text()}`;
       }
-      resultsEl.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(r.total)} songs...</p>`;
-      if (r.done) break;
-    }
-  } catch (e) { resultsEl.innerHTML = copyableBlock(e.message, 'error'); return; }
+    } catch (e) { result.playlistError = e.message; }
 
-  const parts = [];
-  if (totalAutoMarked) parts.push(`<p class="success">${fmt(totalAutoMarked)} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
-  if (!allAdditions.length) {
-    if (!totalAutoMarked) parts.push(`<p class="muted">Nothing missing (${fmt(totalNoCandidates)} songs had no Spotify match at all — check these manually if that seems wrong).</p>`);
-    resultsEl.innerHTML = parts.join('');
-    return;
-  }
-  resultsEl.innerHTML = parts.join('');
-  renderAdditionsApprovalList(resultsEl, allAdditions, true);
-}
-
-// Shared by both the live gap-check run and the durable pending-additions
-// check — same approve/skip UI either way, so a match found in a past
-// interrupted run gets exactly the same review experience as one found
-// just now.
-const PLAYLIST_LABELS = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
-
-function renderAdditionsApprovalList(container, additions, append) {
-  const wrap = document.createElement('div');
-
-  // Counts per playlist, for the summary + filter pills — an item can count
-  // toward more than one playlist if it applies to several companions.
-  const counts = { seen: 0, wes: 0, dad: 0 };
-  additions.forEach(a => a.targets.forEach(t => { if (counts[t] !== undefined) counts[t]++; }));
-  const filterKeys = Object.keys(counts).filter(k => counts[k] > 0);
-  let activeFilter = 'all';
-
-  function rowsHtml(list) {
-    return list.map(a => `
-      <div class="song-row" data-gap-song="${a.songId}">
-        <img class="art" src="${a.track.albumArtUrl || ''}" />
-        <div style="flex:1;min-width:0;">
-          <div>${a.title} — ${a.artist}</div>
-          <div class="muted">${a.track.albumName} &middot; missing from: ${a.targets.map(t => PLAYLIST_LABELS[t] || t).join(', ')}</div>
-        </div>
-        <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
-      </div>
-    `).join('');
-  }
-
-  wrap.innerHTML = `
-    ${filterKeys.length > 1 ? `
-      <div class="row" style="margin-bottom:10px;">
-        <button class="btn secondary filter-pill active" data-filter="all">All (${fmt(additions.length)})</button>
-        ${filterKeys.map(k => `<button class="btn secondary filter-pill" data-filter="${k}">${PLAYLIST_LABELS[k]} (${fmt(counts[k])})</button>`).join('')}
-      </div>
-    ` : ''}
-    <div id="gap-additions">${rowsHtml(additions)}</div>
-    <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(additions.length)} song(s) to playlists</button>
-  `;
-  if (append) { container.appendChild(wrap); } else { container.innerHTML = ''; container.appendChild(wrap); }
-
-  const skipped = new Set();
-  function wireRowButtons() {
-    wrap.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
-      skipped.add(Number(btn.dataset.gapDrop));
-      btn.closest('.song-row').style.opacity = '0.3';
-      btn.disabled = true;
-    });
-  }
-  wireRowButtons();
-
-  wrap.querySelectorAll('.filter-pill').forEach(pill => pill.onclick = () => {
-    activeFilter = pill.dataset.filter;
-    wrap.querySelectorAll('.filter-pill').forEach(p => p.classList.toggle('active', p === pill));
-    const visible = activeFilter === 'all' ? additions : additions.filter(a => a.targets.includes(activeFilter));
-    document.getElementById('gap-additions').innerHTML = rowsHtml(visible);
-    wireRowButtons();
-  });
-
-  wrap.querySelector('#apply-gap-additions-btn').onclick = async () => {
-    const toApply = additions.filter(a => !skipped.has(a.songId));
+    // The actual call that's been failing, tested directly and in
+    // isolation — same endpoint, same fields filter, same everything the
+    // real matching code uses, so if this fails we see its exact raw
+    // response instead of inferring from the (different, working) metadata
+    // call above. Uses the current /items endpoint — GET /tracks was
+    // renamed and removed for Development Mode apps as of March 2026.
     try {
-      const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions: toApply } });
-      wrap.innerHTML = `<p class="success">Added ${applied.added} song(s).</p>`;
-      renderSync();
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-  };
-}
-
-
-
-async function wireAllShowsBrowser() {
-  const listEl = document.getElementById('all-shows-list');
-  const filterEl = document.getElementById('all-shows-filter');
-  let shows = await api('/api/shows/all');
-  let attendedSet = new Set();
-  let attendedError = null;
-  async function loadAttended(force) {
-    try {
-      const r = await api(`/api/setlistfm/attended-ids${force ? '?force=true' : ''}`);
-      attendedSet = new Set(r.ids);
-      attendedError = r.error;
-    } catch (e) { attendedError = e.message; }
-  }
-  await loadAttended(false);
-
-  function artistBadge(a) {
-    if (!a.setlistfm_url) {
-      return `
-        <div style="margin:4px 0;">
-          <span class="muted" style="font-size:12px;">${a.artist}:</span>
-          <button class="btn secondary" data-search-inline="${a.id}" data-search-date="" data-search-artist="${a.artist}" style="font-size:11px;padding:2px 8px;">search setlist.fm</button>
-          <div id="inline-search-${a.id}"></div>
-        </div>`;
-    }
-    // Real check first — this is the source of truth. The local flag only
-    // matters as a fallback for a case the real check somehow misses.
-    const reallyMarked = a.setlistfm_id && attendedSet.has(a.setlistfm_id);
-    if (reallyMarked || a.marked_attended) {
-      return `<div style="margin:4px 0;"><span class="muted" style="font-size:12px;">${a.artist}:</span> <span class="pill win" style="font-size:11px;">&check; I Was There</span> <button class="btn secondary" data-undo-marked="${a.id}" style="font-size:10px;padding:2px 6px;">Undo</button></div>`;
-    }
-    return `
-      <div style="margin:4px 0;">
-        <span class="muted" style="font-size:12px;">${a.artist}:</span>
-        <a href="${a.setlistfm_url}" target="_blank" class="pill" style="font-size:11px;">Setlist Attendance</a>
-        <button class="btn secondary" data-recheck-attended style="font-size:10px;padding:2px 6px;">Refresh Setlist Attendance</button>
-        <button class="btn secondary" data-confirm-marked="${a.id}" style="font-size:10px;padding:2px 6px;" title="Only use this if the check above genuinely isn't picking it up">Mark as Attended (Override)</button>
-      </div>`;
-  }
-
-  function draw(filterText) {
-    const q = (filterText || '').toLowerCase();
-    const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
-    listEl.innerHTML = (attendedError ? `<p class="error" style="font-size:12px;">setlist.fm check: ${attendedError}</p>` : '') + (rows.slice(0, 100).map(s => `
-      <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
-        <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span></div>
-        ${s.artists.map(artistBadge).join('')}
-        <button class="btn secondary" data-edit-show="${s.id}" style="margin-top:4px;">Edit</button>
-        <button class="btn danger" data-delete-show="${s.id}" style="margin-top:4px;">Delete</button>
-      </div>
-    `).join('') || '<p class="muted">No matches.</p>');
-
-    listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
-      wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
-    });
-
-    listEl.querySelectorAll('[data-delete-show]').forEach(btn => btn.onclick = async () => {
-      const show = shows.find(s => s.id === Number(btn.dataset.deleteShow));
-      const label = show ? `${new Date(show.date).toLocaleDateString()} — ${show.venue}${show.headliner ? ` (${show.headliner})` : ''}` : 'this show';
-      if (!confirm(`Permanently delete ${label}? This removes all its songs, artists, and companion data. This can't be undone.`)) return;
-      try {
-        await api(`/api/shows/${btn.dataset.deleteShow}`, { method: 'DELETE' });
-        shows = await api('/api/shows/all');
-        draw(filterEl.value);
-      } catch (e) { showModal(e.message, { title: 'Error' }); }
-    });
-
-    listEl.querySelectorAll('[data-recheck-attended]').forEach(btn => btn.onclick = async () => {
-      btn.textContent = 'checking...';
-      await loadAttended(true);
-      draw(filterEl.value);
-    });
-
-    listEl.querySelectorAll('[data-confirm-marked]').forEach(btn => btn.onclick = async () => {
-      btn.disabled = true;
-      try {
-        await api(`/api/show-artists/${btn.dataset.confirmMarked}/mark-attended`, { method: 'POST' });
-        shows = await api('/api/shows/all');
-        draw(filterEl.value);
-      } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
-    });
-
-    listEl.querySelectorAll('[data-undo-marked]').forEach(btn => btn.onclick = async () => {
-      btn.disabled = true;
-      try {
-        await api(`/api/show-artists/${btn.dataset.undoMarked}/unmark-attended`, { method: 'POST' });
-        shows = await api('/api/shows/all');
-        draw(filterEl.value);
-      } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
-    });
-
-    listEl.querySelectorAll('[data-search-inline]').forEach(btn => btn.onclick = () => {
-      const showArtistId = btn.dataset.searchInline;
-      const box = document.getElementById(`inline-search-${showArtistId}`);
-      box.innerHTML = `
-        <div class="row" style="padding:6px 0;">
-          <input class="inline-sfm-name" value="${btn.dataset.searchArtist}" style="max-width:180px;" />
-          <input class="inline-sfm-date" type="date" value="${btn.dataset.searchDate}" style="max-width:150px;" title="Clear this to search without a date filter" />
-          <button class="btn secondary" data-run-inline-search="${showArtistId}">Search</button>
-        </div>
-        <div id="inline-results-${showArtistId}"></div>
-      `;
-      box.querySelector('[data-run-inline-search]').onclick = async () => {
-        const name = box.querySelector('.inline-sfm-name').value.trim();
-        const dateVal = box.querySelector('.inline-sfm-date').value; // may be empty — that's the point
-        const resultsEl = document.getElementById(`inline-results-${showArtistId}`);
-        resultsEl.innerHTML = '<p class="muted">Searching...</p>';
-        try {
-          const candidates = await api('/api/setlistfm/search', { method: 'POST', body: { artistName: name, date: dateVal || null } });
-          if (!candidates.length) { resultsEl.innerHTML = '<p class="muted">No results. Try clearing the date, or check the spelling matches setlist.fm exactly.</p>'; return; }
-          resultsEl.innerHTML = candidates.map(c => `
-            <div class="row" style="justify-content:space-between;padding:3px 0;">
-              <span class="muted" style="font-size:12px;">${c.date} — ${c.venue}, ${c.city}${c.tour ? ` (${c.tour})` : ''}</span>
-              <button class="btn secondary" data-pick-inline="${c.id}" style="font-size:11px;padding:2px 8px;">Use this</button>
-            </div>
-          `).join('');
-          resultsEl.querySelectorAll('[data-pick-inline]').forEach(pickBtn => pickBtn.onclick = async () => {
-            pickBtn.disabled = true;
-            pickBtn.textContent = 'Saving...';
-            try {
-              await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(showArtistId), setlistId: pickBtn.dataset.pickInline } });
-              resultsEl.innerHTML = '<p class="success">Saved — updating list...</p>';
-              shows = await api('/api/shows/all');
-              draw(filterEl.value);
-            } catch (e) { showModal(e.message, { title: 'Error' }); pickBtn.disabled = false; pickBtn.textContent = 'Use this'; }
-          });
-        } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
-      };
-    });
-  }
-  draw('');
-  filterEl.oninput = () => draw(filterEl.value);
-}
-
-// ---------------- Wizard: tag -> spotify review -> playlist submit ----------------
-let wizardOriginalStage = null;
-
-async function renderWizard() {
-  const show = await api(`/api/shows/${wizardShowId}`);
-  if (wizardOriginalStage === null) wizardOriginalStage = show.stage;
-  if (wizardStage === 'tag') return renderTagStage(show);
-  if (wizardStage === 'spotify') return renderSpotifyStage(show);
-  if (wizardStage === 'playlist') return renderPlaylistStage(show);
-}
-
-function exitWizard() { wizardShowId = null; wizardStage = null; wizardOriginalStage = null; activeTab = 'sync'; renderTab(); }
-
-function toggleYesNoPill(p) {
-  const nowOn = !p.classList.contains('on');
-  p.classList.toggle('on', nowOn);
-  p.textContent = nowOn ? 'Yes' : 'No';
-}
-
-function refreshRowControls(table) {
-  const rows = [...table.querySelectorAll('tr[data-song-row]')];
-  rows.forEach((tr, i) => {
-    tr.querySelector('.order-num').textContent = i + 1;
-    tr.querySelector('[data-move-up]').disabled = i === 0;
-    tr.querySelector('[data-move-down]').disabled = i === rows.length - 1;
-  });
-}
-async function persistOrder(table) {
-  const orderedShowSongIds = [...table.querySelectorAll('tr[data-song-row]')].map(tr => Number(tr.dataset.songRow));
-  const artistId = table.dataset.artistTable;
-  try { await api(`/api/show-artists/${artistId}/reorder`, { method: 'POST', body: { orderedShowSongIds } }); }
-  catch (e) { showModal(e.message, { title: 'Error' }); }
-}
-// Plain global functions invoked via each button's own inline onclick
-// attribute — deliberately not relying on any addEventListener wiring step
-// or event-delegation/closest() timing, so there's nothing that can go
-// stale or fail to attach. window.moveSongUp/Down exist the instant the
-// script loads, and the button's onclick="" references them directly.
-window.moveSongUp = function (id) {
-  const tr = document.querySelector(`tr[data-song-row="${id}"]`);
-  if (!tr) return;
-  const table = tr.closest('table[data-artist-table]');
-  const prev = tr.previousElementSibling;
-  if (table && prev && prev.dataset && prev.dataset.songRow) {
-    tr.parentNode.insertBefore(tr, prev);
-    refreshRowControls(table);
-    persistOrder(table);
-  }
-};
-window.moveSongDown = function (id) {
-  const tr = document.querySelector(`tr[data-song-row="${id}"]`);
-  if (!tr) return;
-  const table = tr.closest('table[data-artist-table]');
-  const next = tr.nextElementSibling;
-  if (table && next && next.dataset && next.dataset.songRow) {
-    tr.parentNode.insertBefore(next, tr);
-    refreshRowControls(table);
-    persistOrder(table);
-  }
-};
-
-async function renderTagStage(show) {
-  const companions = await api('/api/companions');
-  const allSongs = show.artists.flatMap(a => a.songs.map(s => ({ ...s, artistName: a.artist })));
-  const companionIds = new Set(show.companions.map(c => c.id));
-
-  app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
-    <div class="card">
-      <h2>Tag songs — ${new Date(show.date).toLocaleDateString()} · ${show.venue}</h2>
-      ${show.artists.map(a => `
-        <div style="margin-bottom:14px;">
-          <div style="font-weight:500;margin-bottom:6px;">${a.artist}</div>
-          ${a.setlist_source && a.setlist_source !== 'setlist.fm' ? `<p class="muted" style="margin-bottom:6px;">Source: ${a.setlist_source}</p>` : ''}
-          ${a.diff && a.diff.hasChanges ? `
-            <div class="muted" style="margin-bottom:8px;padding:8px 10px;background:var(--surface-2);border-radius:6px;">
-              Changed from the original pull:
-              ${a.diff.added.length ? ` added ${a.diff.added.join(', ')}.` : ''}
-              ${a.diff.removed.length ? ` removed ${a.diff.removed.join(', ')}.` : ''}
-              ${a.diff.reordered ? ` song order changed.` : ''}
-            </div>
-          ` : ''}
-          <div class="row" style="margin-bottom:8px;">
-            <button class="btn secondary" data-fillgap="${a.id}" data-artist="${a.artist}">Replace set from another show</button>
-            <input id="new-song-${a.id}" placeholder="Song title..." style="max-width:220px;" />
-            <button class="btn secondary" data-add-song="${a.id}">Add song</button>
-          </div>
-          <table data-artist-table="${a.id}">
-            <tr><th>#</th><th>Song</th><th>Cover</th><th>Known</th><th>Status</th><th>Regret-eligible</th><th></th></tr>
-            ${a.songs.map((s, i) => `
-              <tr data-song-row="${s.id}">
-                <td style="white-space:nowrap;">
-                  <button class="btn secondary" data-move-up onclick="moveSongUp(${s.id})" style="padding:2px 6px;font-size:11px;" ${i === 0 ? 'disabled' : ''}>&uarr;</button>
-                  <button class="btn secondary" data-move-down onclick="moveSongDown(${s.id})" style="padding:2px 6px;font-size:11px;" ${i === a.songs.length - 1 ? 'disabled' : ''}>&darr;</button>
-                  <span class="order-num">${s.play_order}</span>
-                </td>
-                <td>${s.title}</td>
-                <td>${s.is_cover ? '<span class="pill">cover</span>' : ''}</td>
-                <td><span class="pill known-pill ${s.known ? 'on' : ''}" data-toggle="known">${s.known ? 'Yes' : 'No'}</span></td>
-                <td>
-                  <select class="status-select">
-                    <option value="seen" ${s.status === 'seen' || !s.status ? 'selected' : ''}>Seen</option>
-                    <option value="missed" ${s.status === 'missed' ? 'selected' : ''}>Missed</option>
-                    <option value="skipped" ${s.status === 'skipped' ? 'selected' : ''}>Chose not to see</option>
-                  </select>
-                </td>
-                <td><span class="pill liked-pill ${s.liked_now ? 'on' : ''}" data-toggle="liked">${s.liked_now ? 'Yes' : 'No'}</span></td>
-                <td><button class="btn danger" data-remove-song="${s.id}" style="padding:4px 8px;font-size:11px;">Remove</button></td>
-              </tr>
-            `).join('')}
-          </table>
-        </div>
-      `).join('')}
-    </div>
-    <div class="card">
-      <h2>Who came with you</h2>
-      <div class="row" id="companion-pills">
-        ${companions.map(c => `<span class="pill ${companionIds.has(c.id) ? 'on' : ''}" data-companion="${c.id}">${c.name}</span>`).join('')}
-        <input id="new-companion" placeholder="Add someone new + Enter" style="width:180px;" />
-      </div>
-    </div>
-    <div class="card">
-      <h2>Traveled from</h2>
-      <input id="origin-input" value="${show.origin_address || ''}" />
-    </div>
-    <button class="btn" id="save-tag-btn">Save and continue to Spotify review</button>
-    <div class="error" id="tag-err"></div>
-  `;
-
-  document.getElementById('back-btn').onclick = exitWizard;
-  document.getElementById('cancel-review-btn').onclick = async () => {
-    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
-    if (!confirm(restoreMsg)) return;
-    try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
-      exitWizard();
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-  };
-  app.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => toggleYesNoPill(p));
-  app.querySelectorAll('.pill[data-companion]').forEach(p => p.onclick = () => p.classList.toggle('on'));
-  app.querySelectorAll('[data-fillgap]').forEach(btn => btn.onclick = () => openFillGap(btn.dataset.fillgap, btn.dataset.artist));
-
-  app.querySelectorAll('[data-add-song]').forEach(btn => btn.onclick = async () => {
-    const input = document.getElementById(`new-song-${btn.dataset.addSong}`);
-    const title = input.value.trim();
-    if (!title) return;
-    btn.disabled = true;
-    try {
-      const r = await api(`/api/show-artists/${btn.dataset.addSong}/add-song`, { method: 'POST', body: { title } });
-      const table = document.querySelector(`table[data-artist-table="${btn.dataset.addSong}"]`);
-      const tr = document.createElement('tr');
-      tr.dataset.songRow = r.showSongId;
-      tr.innerHTML = `
-        <td style="white-space:nowrap;">
-          <button class="btn secondary" data-move-up onclick="moveSongUp(${r.showSongId})" style="padding:2px 6px;font-size:11px;">&uarr;</button>
-          <button class="btn secondary" data-move-down onclick="moveSongDown(${r.showSongId})" style="padding:2px 6px;font-size:11px;" disabled>&darr;</button>
-          <span class="order-num">${r.playOrder}</span>
-        </td>
-        <td>${r.title}</td><td></td>
-        <td><span class="pill known-pill" data-toggle="known">No</span></td>
-        <td><select class="status-select"><option value="seen" selected>Seen</option><option value="missed">Missed</option><option value="skipped">Chose not to see</option></select></td>
-        <td><span class="pill liked-pill" data-toggle="liked">No</span></td>
-        <td><button class="btn danger" data-remove-song="${r.showSongId}" style="padding:4px 8px;font-size:11px;">Remove</button></td>
-      `;
-      table.appendChild(tr);
-      refreshRowControls(table);
-      tr.querySelectorAll('.pill[data-toggle]').forEach(p => p.onclick = () => toggleYesNoPill(p));
-      tr.querySelector('[data-remove-song]').onclick = async () => {
-        if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
-        try { await api(`/api/show-songs/${r.showSongId}/remove`, { method: 'POST' }); tr.remove(); refreshRowControls(table); }
-        catch (e) { alert(e.message); }
-      };
-      input.value = '';
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-    btn.disabled = false;
-  });
-  app.querySelectorAll('[data-remove-song]').forEach(btn => btn.onclick = async () => {
-    if (!confirm('Remove this song from the dataset? This can\'t be undone.')) return;
-    try {
-      await api(`/api/show-songs/${btn.dataset.removeSong}/remove`, { method: 'POST' });
-      const table = btn.closest('table');
-      btn.closest('tr').remove();
-      refreshRowControls(table);
-    } catch (e) { alert(e.message); }
-  });
-
-  const newCompanionInput = document.getElementById('new-companion');
-  const pendingNewCompanions = [];
-  newCompanionInput.onkeydown = e => {
-    if (e.key === 'Enter' && newCompanionInput.value.trim()) {
-      const name = newCompanionInput.value.trim();
-      pendingNewCompanions.push(name);
-      const pill = document.createElement('span');
-      pill.className = 'pill on';
-      pill.textContent = name;
-      document.getElementById('companion-pills').insertBefore(pill, newCompanionInput);
-      newCompanionInput.value = '';
-    }
-  };
-
-  document.getElementById('save-tag-btn').onclick = async () => {
-    const songs = [...app.querySelectorAll('[data-song-row]')].map(row => ({
-      showSongId: Number(row.dataset.songRow),
-      known: row.querySelector('.known-pill').classList.contains('on'),
-      status: row.querySelector('.status-select').value,
-      likedNow: row.querySelector('.liked-pill').classList.contains('on'),
-    }));
-    const companionIdsChecked = [...app.querySelectorAll('.pill[data-companion].on')].map(p => Number(p.dataset.companion));
-    try {
-      await api(`/api/shows/${show.id}/tag`, { method: 'POST', body: {
-        songs, companionIds: companionIdsChecked, newCompanionNames: pendingNewCompanions,
-        originAddress: document.getElementById('origin-input').value,
-      }});
-      wizardStage = 'spotify';
-      renderWizard();
-    } catch (e) { document.getElementById('tag-err').textContent = e.message; }
-  };
-}
-
-async function openFillGap(showArtistId, artistName) {
-  const modal = document.createElement('div');
-  modal.className = 'modal-overlay';
-  modal.innerHTML = `
-    <div class="modal-box" style="max-width:520px;text-align:left;max-height:80vh;overflow-y:auto;">
-      <h2>Replace ${artistName}'s set with another show's</h2>
-      <p class="muted" style="margin-top:-8px;">This fully replaces the current set — any known/status/regret flags already set on it will be lost.</p>
-      <div id="fillgap-list"><p class="muted">Searching setlist.fm...</p></div>
-      <button class="btn danger" id="close-fillgap" style="margin-top:14px;">Cancel</button>
-    </div>
-  `;
-  document.body.appendChild(modal);
-  const closeModal = () => modal.remove();
-  modal.querySelector('#close-fillgap').onclick = closeModal;
-  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
-
-  let results = [];
-  try {
-    results = await api(`/api/shows/${wizardShowId}/fill-gap/search`, { method: 'POST', body: { artistName } });
+      const tracksUrl = `https://api.spotify.com/v1/playlists/${playlistId}/items?fields=next,items(item(id,name,artists(name),album(name,images)))&limit=5`;
+      const tracksRes = await fetch(tracksUrl, { headers: { Authorization: `Bearer ${token}` } });
+      if (tracksRes.ok) {
+        const data = await tracksRes.json();
+        result.tracksEndpointWorked = true;
+        result.sampleTrackCount = data.items ? data.items.length : 0;
+      } else {
+        result.tracksEndpointError = `${tracksRes.status}: ${await tracksRes.text()}`;
+      }
+    } catch (e) { result.tracksEndpointError = e.message; }
   } catch (e) {
-    modal.querySelector('#fillgap-list').innerHTML = `<p class="error">${e.message}</p>`;
-    return;
+    result.tokenError = e.message;
   }
-  const listEl = modal.querySelector('#fillgap-list');
-  listEl.innerHTML = results.slice(0, 8).map(r => `<div class="row" style="justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);">
-    <span>${r.date} — ${r.venue}, ${r.city} (${r.songCount} songs)</span>
-    <button class="btn secondary" data-apply-setlist="${r.id}">Use this</button>
-  </div>`).join('') || '<p class="muted">No results.</p>';
-  listEl.querySelectorAll('[data-apply-setlist]').forEach(btn => btn.onclick = async () => {
-    btn.disabled = true;
-    btn.textContent = 'Applying...';
-    try {
-      await api(`/api/shows/${wizardShowId}/fill-gap/apply`, { method: 'POST', body: { setlistId: btn.dataset.applySetlist, showArtistId: Number(showArtistId), artistName } });
-      closeModal();
-      renderWizard();
-    } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; btn.textContent = 'Use this'; }
-  });
-}
+  res.json(result);
+});
 
-async function renderSpotifyStage(show) {
-  const review = await api(`/api/shows/${show.id}/spotify-review`);
-  app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
-    <div class="card">
-      <h2>Review Spotify matches</h2>
-      ${review.map(r => renderMatchRow(r)).join('')}
-      <button class="btn" id="continue-playlist-btn" style="margin-top:14px;">Continue to playlists</button>
-      <div class="error" id="spotify-err"></div>
-    </div>
-  `;
-  document.getElementById('back-btn').onclick = exitWizard;
-  document.getElementById('cancel-review-btn').onclick = async () => {
-    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
-    if (!confirm(restoreMsg)) return;
-    try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
-      exitWizard();
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-  };
+// ---------- Spotify OAuth ----------
+app.get('/api/spotify/connect', requireAuth, (req, res) => {
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
+  res.json({ url: spotify.getAuthUrl(redirectUri, process.env.HOST_PASSWORD) });
+});
 
-  review.forEach(r => {
-    const rowEl = document.getElementById(`match-${r.songId}`);
-    if (!rowEl) return;
-    rowEl.querySelectorAll('[data-select-track]').forEach(b => b.onclick = () => {
-      const candidate = candidateStore[b.dataset.candidateKey];
-      rowEl.dataset.decision = JSON.stringify({ action: 'select', track: candidate });
-      applyRowSelection(r.songId, candidate);
-    });
-    const excludeBtn = rowEl.querySelector('[data-exclude]');
-    if (excludeBtn) excludeBtn.onclick = () => {
-      rowEl.dataset.decision = JSON.stringify({ action: 'exclude' });
-      document.getElementById(`meta-${r.songId}`).innerHTML = `${r.artist} &middot; excluded`;
-      document.getElementById(`actions-${r.songId}`).innerHTML = `<div class="muted" style="margin-left:50px;">Excluded <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button></div>`;
-      document.getElementById(`actions-${r.songId}`).querySelector('[data-manual-search]').onclick = () => openManualSpotifySearch(r, rowEl);
-    };
-    const searchBtn = rowEl.querySelector('[data-manual-search]');
-    if (searchBtn) searchBtn.onclick = () => openManualSpotifySearch(r, rowEl);
-    const removeBtn = rowEl.querySelector('[data-remove-from-dataset]');
-    if (removeBtn) removeBtn.onclick = async () => {
-      if (!confirm(`Remove "${r.title}" from this show's dataset? This can't be undone.`)) return;
-      try {
-        for (const id of (r.showSongIds || [])) {
-          await api(`/api/show-songs/${id}/remove`, { method: 'POST' });
-        }
-        rowEl.remove();
-      } catch (e) { alert(e.message); }
-    };
-  });
-
-  document.getElementById('continue-playlist-btn').onclick = async () => {
-    const decisions = [];
-    review.forEach(r => {
-      const rowEl = document.getElementById(`match-${r.songId}`);
-      if (!rowEl) return; // removed from the dataset above — nothing to decide on
-      const raw = rowEl.dataset.decision;
-      if (raw) decisions.push({ songId: r.songId, ...JSON.parse(raw) });
-      else if (r.status === 'pending' && r.suggested) decisions.push({ songId: r.songId, action: 'approve', track: r.suggested });
-    });
-    try {
-      await api(`/api/shows/${show.id}/spotify-review`, { method: 'POST', body: { decisions } });
-      wizardStage = 'playlist';
-      renderWizard();
-    } catch (e) { document.getElementById('spotify-err').textContent = e.message; }
-  };
-}
-
-function renderMatchRow(r) {
-  const candidates = r.status === 'pending' ? (r.candidates || []) : [];
-  const current = r.current;
-  const noMatchText = r.searchError ? `search failed: ${r.searchError}` : (r.status === 'assumed_added' ? 'not yet tied to a Spotify track — run "Spotify gaps check" on the Sync page' : 'no match found');
-  const statusLabel = r.status === 'excluded' ? 'Excluded'
-    : r.status === 'assumed_added' && !current ? 'Marked as already on Spotify, but not yet resolved'
-    : 'Already resolved';
-  return `
-    <div id="match-${r.songId}" style="margin-bottom:12px;">
-      <div class="song-row">
-        <img class="art" id="art-${r.songId}" src="${(current && current.albumArtUrl) || (r.suggested && r.suggested.albumArtUrl) || ''}" />
-        <div style="flex:1;min-width:0;">
-          <div style="font-weight:500;">${r.title}</div>
-          <div class="muted" id="meta-${r.songId}">${r.artist} ${current ? `&middot; ${current.albumName || ''}` : r.suggested ? `&middot; ${r.suggested.albumName}` : `&middot; ${noMatchText}`}</div>
-        </div>
-      </div>
-      <div id="actions-${r.songId}">
-        ${r.status === 'pending' ? `
-          <div class="row" style="margin:6px 0 0 50px;">
-            ${candidates.slice(0, 3).map(c => `<button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-select-track>${c.albumName}</button>`).join('')}
-            <button class="btn danger" data-exclude>Exclude</button>
-            <button class="btn secondary" data-manual-search>Search Spotify</button>
-            <button class="btn danger" data-remove-from-dataset>Remove from dataset</button>
-          </div>
-        ` : `<div class="muted" style="margin-left:50px;">${statusLabel} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button> <button class="btn danger" data-remove-from-dataset style="margin-left:8px;">Remove from dataset</button></div>`}
-      </div>
-      <div id="manual-search-${r.songId}"></div>
-    </div>
-  `;
-}
-
-// Updates a match row's art/text in place and collapses its action area to
-// a simple "Selected — Change" state, so picking a track actually looks
-// like something happened instead of just a green confirmation line.
-function applyRowSelection(songId, track) {
-  document.getElementById(`art-${songId}`).src = track.albumArtUrl || '';
-  document.getElementById(`meta-${songId}`).innerHTML = `${track.artist} &middot; ${track.albumName}`;
-  document.getElementById(`manual-search-${songId}`).innerHTML = '';
-  document.getElementById(`actions-${songId}`).innerHTML = `<div class="muted" style="margin-left:50px;">Selected: ${track.name} <button class="btn secondary" data-manual-search style="margin-left:8px;">Change</button></div>`;
-  document.getElementById(`actions-${songId}`).querySelector('[data-manual-search]').onclick = () => openManualSpotifySearch({ songId, title: track.name, artist: track.artist }, document.getElementById(`match-${songId}`));
-}
-
-async function openManualSpotifySearch(r, rowEl) {
-  const box = document.getElementById(`manual-search-${r.songId}`);
-  box.innerHTML = `
-    <div class="row" style="margin:8px 0 0 50px;">
-      <input id="ms-title-${r.songId}" placeholder="Song title" value="${r.title}" style="max-width:220px;" />
-      <input id="ms-artist-${r.songId}" placeholder="Artist (optional)" value="${r.artist}" style="max-width:180px;" />
-      <button class="btn secondary" id="ms-go-${r.songId}">Search Spotify</button>
-    </div>
-    <div id="ms-results-${r.songId}" style="margin-left:50px;"></div>
-  `;
-  document.getElementById(`ms-go-${r.songId}`).onclick = async () => {
-    const resultsEl = document.getElementById(`ms-results-${r.songId}`);
-    resultsEl.innerHTML = '<p class="muted">Searching...</p>';
-    const query = document.getElementById(`ms-title-${r.songId}`).value;
-    const artist = document.getElementById(`ms-artist-${r.songId}`).value;
-    try {
-      const results = await api('/api/spotify/search', { method: 'POST', body: { query, artist } });
-      if (!results.length) { resultsEl.innerHTML = '<p class="muted">No results.</p>'; return; }
-      resultsEl.innerHTML = results.slice(0, 8).map(c => `
-        <div class="song-row" style="margin-top:6px;">
-          <img class="art" src="${c.albumArtUrl || ''}" />
-          <div style="flex:1;min-width:0;">
-            <div>${c.name}</div>
-            <div class="muted">${c.artist} &middot; ${c.albumName} ${c.albumType === 'live' || /live/i.test(c.albumName) ? '(live)' : ''}</div>
-          </div>
-          <button class="btn secondary" data-candidate-key="${stashCandidate(c)}" data-manual-pick>Use this</button>
-        </div>
-      `).join('');
-      resultsEl.querySelectorAll('[data-manual-pick]').forEach(btn => btn.onclick = () => {
-        const track = candidateStore[btn.dataset.candidateKey];
-        rowEl.dataset.decision = JSON.stringify({ action: 'select', track });
-        applyRowSelection(r.songId, track);
-      });
-    } catch (e) { resultsEl.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-}
-
-async function renderPlaylistStage(show) {
-  const preview = await api(`/api/shows/${show.id}/playlist-preview`);
-  app.innerHTML = `
-    <button class="btn secondary" id="back-btn" style="margin-bottom:14px;">&larr; Back to Sync</button> <button class="btn danger" id="cancel-review-btn" style="margin-bottom:14px;">${wizardOriginalStage === 'complete' ? 'Cancel (restore to complete)' : 'Cancel review'}</button>
-    <div class="card">
-      <h2>Ready to add to playlists</h2>
-      ${preview.targets.map(t => `
-        <div style="margin-bottom:14px;">
-          <div style="font-weight:500;margin-bottom:6px;">${t.label}</div>
-          ${preview.songs.map(s => `
-            <div class="song-row" data-song="${s.show_song_id}">
-              <img class="art" src="${s.spotify_album_art_url || ''}" />
-              <div style="flex:1;">${s.title} — ${s.artist}</div>
-              <button class="btn danger" data-drop="${s.show_song_id}">Drop</button>
-            </div>
-          `).join('')}
-        </div>
-      `).join('')}
-      <div class="row" style="margin-top:14px;">
-        <button class="btn" id="submit-playlists-btn">Add to playlists</button>
-        <button class="btn secondary" id="skip-sync-btn">Save changes only, don't sync to Spotify</button>
-      </div>
-      <p class="muted" style="margin-top:6px;">The second option saves your dataset edits but leaves Spotify untouched — anything that ends up out of sync will show up under "Playlist updates needed" on the Sync page.</p>
-      <div class="success" id="playlist-ok"></div>
-      <div class="error" id="playlist-err"></div>
-    </div>
-  `;
-  document.getElementById('back-btn').onclick = exitWizard;
-  document.getElementById('cancel-review-btn').onclick = async () => {
-    const restoreMsg = wizardOriginalStage === 'complete' ? "This show was already complete before you started editing — cancel and restore it to complete (any edits you made this session are kept, but it won't sit \"in progress\" anymore)?" : "Cancel and put this show back where it was before you started this session? Anything already saved stays as-is.";
-    if (!confirm(restoreMsg)) return;
-    try {
-      await api(`/api/shows/${wizardShowId}/reset-stage`, { method: 'POST', body: { stage: wizardOriginalStage } });
-      exitWizard();
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-  };
-  const drops = new Set();
-  app.querySelectorAll('[data-drop]').forEach(btn => btn.onclick = () => {
-    drops.add(btn.dataset.drop);
-    btn.closest('.song-row').style.opacity = '0.3';
-    btn.disabled = true;
-  });
-  async function submit(skipSync) {
-    try {
-      const r = await api(`/api/shows/${show.id}/playlist-submit`, { method: 'POST', body: { drops: [...drops], skipSync } });
-      document.getElementById('playlist-ok').textContent = skipSync ? 'Saved. Show complete — nothing was sent to Spotify.' : `Added ${r.added} songs. Show complete.`;
-      setTimeout(exitWizard, 1200);
-    } catch (e) { document.getElementById('playlist-err').textContent = e.message; }
-  }
-  document.getElementById('submit-playlists-btn').onclick = () => submit(false);
-  document.getElementById('skip-sync-btn').onclick = () => submit(true);
-}
-
-// ---------------- Reports (Dashboard subtabs) ----------------
-
-let chartTooltipEl = null;
-function ensureTooltipEl() {
-  if (!chartTooltipEl) {
-    chartTooltipEl = document.createElement('div');
-    chartTooltipEl.className = 'chart-tooltip';
-    document.body.appendChild(chartTooltipEl);
-  }
-  return chartTooltipEl;
-}
-
-function barChartHtml(id, rows, labelFn) {
-  const counts = rows.map(r => Number(r.shows));
-  const max = Math.max(...counts, 1);
-  return `
-    <div class="bar-chart" id="${id}">
-      ${rows.map(r => `
-        <div class="bar-col" data-shows="${r.shows}" data-artists="${r.artists}" data-songs="${r.songs}" data-venues="${r.venues}" data-label="${labelFn(r.bucket)}">
-          <div class="bar-datalabel">${r.shows}</div>
-          <div class="bar" style="height:${Math.max(4, (Number(r.shows) / max) * 140)}px;"></div>
-          <div class="bar-axislabel">${labelFn(r.bucket)}</div>
-        </div>
-      `).join('')}
-    </div>
-  `;
-}
-
-function wireBarChart(id) {
-  const tip = ensureTooltipEl();
-  document.querySelectorAll(`#${id} .bar-col`).forEach(col => {
-    col.addEventListener('mouseenter', () => {
-      tip.innerHTML = `<b>${col.dataset.label}</b><br>${col.dataset.shows} shows<br>${col.dataset.artists} unique artists<br>${col.dataset.songs} unique songs<br>${col.dataset.venues} unique venues`;
-      tip.style.display = 'block';
-    });
-    col.addEventListener('mousemove', e => {
-      tip.style.left = (e.pageX + 14) + 'px';
-      tip.style.top = (e.pageY - 10) + 'px';
-    });
-    col.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
-  });
-}
-
-async function renderOverview() {
-  const data = await api(`/api/report/overview${companionsQuery()}`);
-  const t = data.totals;
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>Overview</h2>
-      <div class="stat-grid" style="margin-bottom:20px;">
-        <div class="stat-tile"><div class="num">${fmt(t.shows)}</div><div class="label">Shows</div></div>
-        <div class="stat-tile"><div class="num">${fmt(t.unique_artists)}</div><div class="label">Unique Artists</div></div>
-        <div class="stat-tile"><div class="num">${fmt(t.unique_songs)}</div><div class="label">Unique songs</div></div>
-        <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
-      </div>
-      <div class="row" style="margin-bottom:12px;">
-        <button class="btn secondary" id="expand-all-btn">⇊ Expand all</button>
-        <button class="btn secondary" id="collapse-all-btn">⇈ Collapse all</button>
-      </div>
-      <table>
-        <tr><th></th><th>Date</th><th>Headliner</th><th>Location</th><th>Traveled from</th></tr>
-        ${data.shows.map(renderShowRow).join('')}
-      </table>
-    </div>
-  `;
-  wireExpanders();
-  document.getElementById('expand-all-btn').onclick = () => {
-    dashBody().querySelectorAll('.nested-block').forEach(b => b.classList.remove('hidden'));
-    dashBody().querySelectorAll('[data-expand]').forEach(icon => icon.textContent = '−');
-    updateExpandCollapseButtons();
-  };
-  document.getElementById('collapse-all-btn').onclick = () => {
-    dashBody().querySelectorAll('.nested-block').forEach(b => b.classList.add('hidden'));
-    dashBody().querySelectorAll('[data-expand]').forEach(icon => icon.textContent = '+');
-    updateExpandCollapseButtons();
-  };
-  updateExpandCollapseButtons();
-}
-
-function updateExpandCollapseButtons() {
-  const blocks = [...dashBody().querySelectorAll('.nested-block')];
-  const expandBtn = document.getElementById('expand-all-btn');
-  const collapseBtn = document.getElementById('collapse-all-btn');
-  if (expandBtn) expandBtn.disabled = !blocks.some(b => b.classList.contains('hidden'));
-  if (collapseBtn) collapseBtn.disabled = !blocks.some(b => !b.classList.contains('hidden'));
-}
-
-function renderShowRow(sh) {
-  return `
-    <tr class="show-row">
-      <td><span class="expand-icon" data-expand="show-${sh.id}">+</span></td>
-      <td>${new Date(sh.date).toLocaleDateString()}</td>
-      <td>${sh.headliner}</td>
-      <td>${sh.location}</td>
-      <td>${sh.traveledFrom || '—'}</td>
-    </tr>
-    <tr class="nested-block hidden" id="block-show-${sh.id}"><td colspan="5">
-      <table>
-        <tr><th></th><th>Artist</th><th>Order</th><th>Songs</th><th>Known</th><th>Opener</th><th>Closer</th></tr>
-        ${sh.artists.map(renderArtistRow).join('')}
-      </table>
-    </td></tr>
-  `;
-}
-
-function renderArtistRow(a) {
-  return `
-    <tr class="artist-row">
-      <td><span class="expand-icon" data-expand="artist-${a.showArtistId}">+</span></td>
-      <td>${a.artist}</td>
-      <td>${a.orderLabel}</td>
-      <td>${a.songCount}</td>
-      <td>${a.pctKnown}%</td>
-      <td>${a.opener || '—'}</td>
-      <td>${a.closer || '—'}</td>
-    </tr>
-    <tr class="nested-block hidden" id="block-artist-${a.showArtistId}"><td colspan="7">
-      <table>
-        <tr><th>Song</th><th>Known</th><th>Missed</th><th>Regret</th></tr>
-        ${a.songs.map(s => `<tr><td>${s.title}</td><td>${s.known ? 'Yes' : 'No'}</td><td>${s.missed ? 'Yes' : 'No'}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('')}
-      </table>
-    </td></tr>
-  `;
-}
-
-function wireExpanders() {
-  app.querySelectorAll('[data-expand]').forEach(icon => {
-    icon.onclick = () => {
-      const block = document.getElementById(`block-${icon.dataset.expand}`);
-      if (!block) return;
-      const wasHidden = block.classList.contains('hidden');
-      block.classList.toggle('hidden');
-      icon.textContent = wasHidden ? '−' : '+';
-      updateExpandCollapseButtons();
-    };
-  });
-}
-
-async function renderTrends() {
-  const data = await api(`/api/report/trends${companionsQuery()}`);
-  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const wk = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  dashBody().innerHTML = `
-    <div class="card"><h2>Shows by year</h2>${barChartHtml('chart-year', data.byYear, b => b)}</div>
-    <div class="card"><h2>Shows by month</h2>${barChartHtml('chart-month', data.byMonth, b => monthNames[b - 1])}</div>
-    <div class="card"><h2>Shows by season</h2>${barChartHtml('chart-season', data.bySeason, b => b)}</div>
-    <div class="card"><h2>Shows by weekday</h2>${barChartHtml('chart-weekday', data.byWeekday, b => wk[b])}</div>
-  `;
-  ['chart-year', 'chart-month', 'chart-season', 'chart-weekday'].forEach(wireBarChart);
-}
-
-async function renderTravel() {
-  const data = await api(`/api/report/travel${companionsQuery()}`);
-  const hours = Math.round((data.totals.hours || 0) * 10) / 10;
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>Travel</h2>
-      <div class="stat-grid" style="margin-bottom:16px;">
-        <div class="stat-tile"><div class="num">${fmt(Math.round(data.totals.miles || 0))}</div><div class="label">Total miles</div></div>
-        <div class="stat-tile"><div class="num">${fmt(hours)}</div><div class="label">Total travel time (hrs)</div></div>
-      </div>
-    </div>
-    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
-      <div class="card" style="flex:1;min-width:280px;">
-        <h2>Local shows (Georgia)</h2>
-        <table>
-          <tr><th>Venue</th><th>Shows seen</th></tr>
-          ${data.local.map(v => `<tr><td>${v.venue}</td><td>${v.show_count}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
-        </table>
-      </div>
-      <div class="card" style="flex:1;min-width:280px;">
-        <h2>Travel shows</h2>
-        <table>
-          <tr><th>Venue</th><th>City</th><th>State</th><th>Miles</th><th>Travel time</th><th>Bands</th></tr>
-          ${data.travel.map(s => `<tr><td>${s.venue}</td><td>${s.city || '—'}</td><td>${s.state || '—'}</td><td>${s.distance_miles != null ? fmt(s.distance_miles) : '—'}</td><td>${s.duration_minutes != null ? (Math.round((s.duration_minutes / 60) * 10) / 10) + ' hrs' : '—'}</td><td>${s.bands || '—'}</td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
-        </table>
-      </div>
-    </div>
-  `;
-}
-
-async function renderSuperlatives() {
-  const data = await api(`/api/report/superlatives${companionsQuery()}`);
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>Bands seen the most</h2>
-      <table>
-        <tr><th>Artist</th><th>Times seen</th><th>Song count</th><th>Headline %</th><th>Setlist variation %</th><th>Opener/closer variation %</th><th></th></tr>
-        ${data.bandsSeenMost.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.songCount}</td><td>${r.pctHeadline}%</td><td>${r.setlistVariationPct}%</td><td>${r.openCloseVariationPct}%</td><td><button class="btn secondary" data-drill="bands-seen" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('')}
-      </table>
-    </div>
-    <div class="card">
-      <h2>Most songs played in a set</h2>
-      <table>
-        <tr><th>Date</th><th>Artist</th><th>Songs</th><th></th></tr>
-        ${data.mostSongsInSet.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.artist}</td><td>${r.songCount}</td><td><button class="btn secondary" data-drill="set" data-date="${new Date(r.date).toISOString().slice(0,10)}" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">None yet</td></tr>'}
-      </table>
-    </div>
-    <div class="row" style="align-items:flex-start;gap:20px;flex-wrap:wrap;">
-      <div class="card" style="flex:1;min-width:280px;">
-        <h2>Most new songs vs. the show before (repeat artists)</h2>
-        <p class="muted" style="margin-bottom:8px;">Compares each show to that same artist's immediately preceding show — the biggest jump in new songs from one time to the next.</p>
-        <table>
-          <tr><th>Artist</th><th>Times seen</th><th>New songs in a set</th><th></th></tr>
-          ${data.mostUniqueSongsRepeat.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.newSongsInASet}</td><td><button class="btn secondary" data-drill="repeat-compare" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
-        </table>
-      </div>
-      <div class="card" style="flex:1;min-width:280px;">
-        <h2>Most opener/closer variation</h2>
-        <p class="muted" style="margin-bottom:8px;">Limited to artists you've seen more than once.</p>
-        <table>
-          <tr><th>Artist</th><th>Times seen</th><th>Variation %</th><th></th></tr>
-          ${data.mostOpenCloseVariation.map(r => `<tr><td>${r.artist}</td><td>${r.timesSeen}</td><td>${r.openCloseVariationPct}%</td><td><button class="btn secondary" data-drill="open-close" data-artist="${r.artist}" style="padding:2px 8px;">&rsaquo;</button></td></tr>`).join('') || '<tr><td class="muted">Not enough repeat artists yet</td></tr>'}
-        </table>
-      </div>
-    </div>
-  `;
-  dashBody().querySelectorAll('[data-drill]').forEach(btn => btn.onclick = () => openSuperlativeDrilldown(btn.dataset.drill, btn.dataset.artist, btn.dataset.date));
-}
-
-function openDrilldownModal(title, bodyHtml) {
-  const modal = document.createElement('div');
-  modal.className = 'modal-overlay';
-  modal.innerHTML = `
-    <div class="modal-box" style="max-width:600px;text-align:left;max-height:80vh;overflow-y:auto;">
-      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h2 style="margin:0;">${title}</h2>
-        <button class="btn secondary" id="close-drilldown" style="padding:4px 10px;">&times;</button>
-      </div>
-      ${bodyHtml}
-    </div>
-  `;
-  document.body.appendChild(modal);
-  modal.querySelector('#close-drilldown').onclick = () => modal.remove();
-  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-}
-
-async function openSuperlativeDrilldown(type, artist, date) {
+app.get('/api/spotify/callback', async (req, res) => {
+  const { code } = req.query;
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
   try {
-    if (type === 'bands-seen') {
-      const rows = await api(`/api/superlatives/drilldown/bands-seen/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`Every time you've seen ${artist}`, `<table><tr><th>Date</th><th>Venue</th><th>Headliner</th><th>Songs</th><th>Opener</th><th>Closer</th><th>Tour</th><th></th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}, ${r.city}</td><td>${r.headliner || '—'}</td><td>${r.song_count}</td><td>${r.opener || '—'}</td><td>${r.closer || '—'}</td><td>${r.tour_name || '—'}</td><td>${r.setlistfm_url ? `<a href="${r.setlistfm_url}" target="_blank" style="color:var(--violet);">view</a>` : '—'}</td></tr>`).join('')}</table>`);
-    } else if (type === 'set') {
-      const rows = await api(`/api/superlatives/drilldown/set/${date}/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`${artist} — ${new Date(date).toLocaleDateString()}`, `<table><tr><th>#</th><th>Song</th><th>Known</th></tr>${rows.map(r => `<tr><td>${r.play_order}</td><td>${r.title}</td><td>${r.known ? 'Yes' : 'No'}</td></tr>`).join('')}</table>`);
-    } else if (type === 'open-close') {
-      const rows = await api(`/api/superlatives/drilldown/open-close/${encodeURIComponent(artist)}`);
-      openDrilldownModal(`${artist} — openers &amp; closers`, `<table><tr><th>Date</th><th>Venue</th><th>Opener</th><th>Closer</th></tr>${rows.map(r => `<tr><td>${new Date(r.date).toLocaleDateString()}</td><td>${r.venue}</td><td>${r.opener}</td><td>${r.closer}</td></tr>`).join('')}</table>`);
-    } else if (type === 'repeat-compare') {
-      const d = await api(`/api/superlatives/drilldown/repeat-compare/${encodeURIComponent(artist)}`);
-      if (!d) { openDrilldownModal(artist, '<p class="muted">Not enough data.</p>'); return; }
-      const maxLen = Math.max(d.overlap.length, d.prevOnly.length, d.currOnly.length);
-      const rows = [];
-      for (let i = 0; i < maxLen; i++) {
-        rows.push(`<tr><td>${d.overlap[i] || ''}</td><td>${i < d.overlap.length ? '' : (d.prevOnly[i - d.overlap.length] || '')}</td><td>${i < d.overlap.length ? '' : (d.currOnly[i - d.overlap.length] || '')}</td></tr>`);
+    await spotify.exchangeCodeForToken(code, redirectUri);
+    res.send('<html><body>Spotify connected — you can close this tab and go back to the app.</body></html>');
+  } catch (e) {
+    res.status(500).send(`Spotify connection failed: ${e.message}`);
+  }
+});
+
+const fs = require('fs');
+app.post('/api/import/historical', requireAuth, async (req, res) => {
+  try {
+    const seedPath = path.join(__dirname, 'seed', 'historical_seed.json');
+    const shows = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
+    let imported = 0, skipped = 0, geoFilled = 0;
+    const geoFailures = [];
+    const venueCoordCache = {};
+    let artistsAdded = 0;
+    let artistsReplaced = 0;
+
+    async function insertArtistBlock(showId, artistBlock) {
+      const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
+      const artistRow = (await pool.query(
+        'INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+        [showId, artistBlock.artist, artistBlock.billing_order, JSON.stringify(originalTitles), 'spreadsheet import']
+      )).rows[0];
+      for (const s of artistBlock.songs) {
+        const song = await findOrCreateSong(artistBlock.artist, s.song);
+        if (s.already_on_spotify && song.spotify_status === 'pending') {
+          await pool.query(`UPDATE songs SET spotify_status='assumed_added' WHERE id=$1`, [song.id]);
+        }
+        await pool.query(
+          `INSERT INTO show_songs (show_artist_id, song_id, play_order, known, liked_now, status, already_on_spotify, added_to_seen)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [artistRow.id, song.id, s.play_order, s.known, s.liked_now, s.status, s.already_on_spotify, s.already_on_spotify]
+        );
       }
-      openDrilldownModal(`${artist} — ${new Date(d.prevShow.date).toLocaleDateString()} vs ${new Date(d.currShow.date).toLocaleDateString()}`, `
-        <p class="muted">Overlapping songs first, then each show's songs the other didn't have.</p>
-        <table>
-          <tr><th>Played both times</th><th>${d.prevShow.venue} only</th><th>${d.currShow.venue} only</th></tr>
-          ${rows.join('')}
-        </table>
-      `);
     }
-  } catch (e) { showModal(e.message, { title: 'Error' }); }
+
+    // Same as insertArtistBlock, but for an artist that already has a row
+    // (typically from a live setlist.fm sync) — replaces its songs with
+    // the spreadsheet's version instead of creating a duplicate, and marks
+    // the source as spreadsheet import so this is idempotent: re-running
+    // import won't redo this once it's already been corrected.
+    async function replaceArtistFromSpreadsheet(showArtistId, artistBlock) {
+      await pool.query('DELETE FROM show_songs WHERE show_artist_id=$1', [showArtistId]);
+      const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
+      await pool.query(
+        `UPDATE show_artists SET billing_order=$1, original_setlist=$2, setlist_source='spreadsheet import' WHERE id=$3`,
+        [artistBlock.billing_order, JSON.stringify(originalTitles), showArtistId]
+      );
+      for (const s of artistBlock.songs) {
+        const song = await findOrCreateSong(artistBlock.artist, s.song);
+        if (s.already_on_spotify && song.spotify_status === 'pending') {
+          await pool.query(`UPDATE songs SET spotify_status='assumed_added' WHERE id=$1`, [song.id]);
+        }
+        await pool.query(
+          `INSERT INTO show_songs (show_artist_id, song_id, play_order, known, liked_now, status, already_on_spotify, added_to_seen)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [showArtistId, song.id, s.play_order, s.known, s.liked_now, s.status, s.already_on_spotify, s.already_on_spotify]
+        );
+      }
+    }
+
+    for (const show of shows) {
+      const already = (await pool.query('SELECT id, distance_miles, duration_minutes FROM shows WHERE date=$1 AND venue=$2', [show.date, show.venue])).rows[0];
+      if (already) {
+        skipped++;
+
+        // Reconcile artists on an already-imported show: add any artist in
+        // the seed that isn't in the database yet (e.g. a headliner you
+        // skipped and didn't originally log), fix billing order, and — the
+        // important case — if an artist here came from a live setlist.fm
+        // sync rather than a prior spreadsheet import, your spreadsheet is
+        // authoritative and should replace it. Otherwise a live sync that
+        // happened to run first permanently locks in setlist.fm's raw data
+        // (including things like walk-off/outro songs you deliberately
+        // left out) with no way for your curated version to ever apply.
+        const existingArtists = (await pool.query('SELECT id, artist, billing_order, setlist_source FROM show_artists WHERE show_id=$1', [already.id])).rows;
+        const existingByName = {};
+        existingArtists.forEach(a => { existingByName[a.artist] = a; });
+        for (const artistBlock of show.artists) {
+          const existing = existingByName[artistBlock.artist];
+          if (!existing) {
+            await insertArtistBlock(already.id, artistBlock);
+            artistsAdded++;
+          } else if (existing.setlist_source !== 'spreadsheet import') {
+            await replaceArtistFromSpreadsheet(existing.id, artistBlock);
+            artistsReplaced++;
+          } else if (existing.billing_order !== artistBlock.billing_order) {
+            await pool.query('UPDATE show_artists SET billing_order=$1 WHERE id=$2', [artistBlock.billing_order, existing.id]);
+          }
+        }
+
+        // Already imported, but if it's still missing travel data (e.g. a
+        // past geocoding failure), retry just that part — don't touch its
+        // songs/companions again, just fill in what's missing.
+        if (already.distance_miles === null || already.duration_minutes === null) {
+          let venueErr = null, originCoord = null, originErr = null, distErr = null;
+          const venueCoord = await ors.geocodeVenue(show.venue, show.city, show.state);
+          await ors.sleep(250);
+          try { originCoord = await ors.geocode(show.origin_address); } catch (e) { originErr = e.message; }
+          await ors.sleep(250);
+          if (venueCoord && originCoord) {
+            try {
+              const distance = await ors.drivingDistance(originCoord, venueCoord);
+              await pool.query(
+                'UPDATE shows SET venue_lat=$1, venue_lng=$2, origin_lat=$3, origin_lng=$4, distance_miles=$5, duration_minutes=$6 WHERE id=$7',
+                [venueCoord.lat, venueCoord.lng, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, already.id]
+              );
+              geoFilled++;
+            } catch (e) { distErr = e.message; }
+          }
+          if (!(venueCoord && originCoord && !distErr)) {
+            const reason = !venueCoord ? `Venue and city both failed to geocode for "${show.venue}, ${show.city}"`
+              : !originCoord ? `Origin geocode failed: ${originErr || `no results for "${show.origin_address}"`}`
+              : `Directions failed: ${distErr}`;
+            geoFailures.push({ venue: show.venue, date: show.date, reason });
+          }
+        }
+        continue;
+      }
+
+      const venueKey = `${show.venue}, ${show.city}, ${show.state}`;
+      if (!(venueKey in venueCoordCache)) {
+        try { venueCoordCache[venueKey] = await ors.geocodeVenue(show.venue, show.city, show.state); }
+        catch (e) { venueCoordCache[venueKey] = null; }
+        await ors.sleep(250);
+      }
+      const venueCoord = venueCoordCache[venueKey];
+      let originCoord = null;
+      try { originCoord = await ors.geocode(show.origin_address); } catch (e) {}
+      await ors.sleep(250);
+      let distance = null;
+      if (venueCoord && originCoord) {
+        try { distance = await ors.drivingDistance(originCoord, venueCoord); } catch (e) {}
+      }
+
+      const showRow = (await pool.query(
+        `INSERT INTO shows (date, venue, city, state, country, origin_address, origin_lat, origin_lng, venue_lat, venue_lng, distance_miles, duration_minutes, stage)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'complete') RETURNING id`,
+        [show.date, show.venue, show.city, show.state, show.country, show.origin_address,
+         originCoord ? originCoord.lat : null, originCoord ? originCoord.lng : null,
+         venueCoord ? venueCoord.lat : null, venueCoord ? venueCoord.lng : null,
+         distance ? distance.miles : null, distance ? distance.minutes : null]
+      )).rows[0];
+
+      for (const companionName of show.companions) {
+        const existing = (await pool.query('SELECT id FROM companions WHERE name=$1', [companionName])).rows[0];
+        const companionId = existing ? existing.id : (await pool.query('INSERT INTO companions (name) VALUES ($1) RETURNING id', [companionName])).rows[0].id;
+        await pool.query('INSERT INTO show_companions (show_id, companion_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [showRow.id, companionId]);
+      }
+
+      for (const artistBlock of show.artists) {
+        await insertArtistBlock(showRow.id, artistBlock);
+      }
+      imported++;
+    }
+    res.json({ ok: true, imported, skipped, geoFilled, geoFailures, artistsAdded, artistsReplaced });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- companions ----------
+app.get('/api/companions', requireAuth, async (req, res) => {
+  res.json((await pool.query('SELECT * FROM companions ORDER BY name')).rows);
+});
+
+// ---------- sync ----------
+app.post('/api/sync', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  if (!cfg.setlistfm_username) return res.status(400).json({ error: 'Set your setlist.fm username in Settings first.' });
+
+  const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+  const newShowIds = [];
+
+  for (const entry of attended) {
+    const venue = entry.venue.name;
+    const city = entry.venue.city.name;
+    const state = entry.venue.city.state || null;
+    const country = entry.venue.city.country.name;
+    const [d, m, y] = entry.eventDate.split('-'); // setlist.fm format: dd-MM-yyyy
+    const isoDate = `${y}-${m}-${d}`;
+
+    // setlist.fm gives a SEPARATE setlist id per artist per show — Lynyrd
+    // Skynyrd, Foreigner, and an opener at the same concert each get their
+    // own id. A show, in this app, is identified by date+venue (same as
+    // everywhere else in the codebase) — matching on entry.id here was the
+    // actual bug: syncing a second artist from an already-synced show
+    // looked "new" and created a duplicate show for the same night.
+    let showRow = (await pool.query('SELECT id FROM shows WHERE date=$1 AND venue=$2', [isoDate, venue])).rows[0];
+    const showIsNew = !showRow;
+
+    if (!showRow) {
+      showRow = (await pool.query(
+        `INSERT INTO shows (date, venue, city, state, country, setlistfm_event_id, origin_address, stage)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'new') RETURNING id`,
+        [isoDate, venue, city, state, country, entry.id, cfg.default_origin_address]
+      )).rows[0];
+      try {
+        const venueCoord = await ors.geocodeVenue(venue, city, state);
+        if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, showRow.id]);
+      } catch (e) { /* non-fatal — travel distance can be filled in later */ }
+    }
+
+    // This artist's performance specifically — skip if we already have it
+    // (this is what actually prevents the duplicate-artist/duplicate-show
+    // problem, regardless of whether the show itself was just created or
+    // already existed).
+    const existingArtist = (await pool.query('SELECT id FROM show_artists WHERE show_id=$1 AND artist=$2', [showRow.id, entry.artist.name])).rows[0];
+    if (existingArtist) continue;
+
+    const songs = setlistfm.flattenSetlistSongs(entry);
+    const artistRow = (await pool.query(
+      `INSERT INTO show_artists (show_id, artist, billing_order, original_setlist, setlist_source, tour_name, setlistfm_id, setlistfm_url, setlistfm_checked, marked_attended)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,true) RETURNING id`,
+      [showRow.id, entry.artist.name, null, JSON.stringify(songs.map(s => s.name)), 'setlist.fm', entry.tour ? entry.tour.name : null, entry.id, entry.url || null]
+    )).rows[0];
+
+    let order = 1;
+    for (const s of songs) {
+      const song = await findOrCreateSong(entry.artist.name, s.name);
+      await pool.query(
+        'INSERT INTO show_songs (show_artist_id, song_id, play_order, is_cover) VALUES ($1,$2,$3,$4)',
+        [artistRow.id, song.id, order++, s.isCover]
+      );
+    }
+
+    if (showIsNew) newShowIds.push(showRow.id);
+  }
+
+  await pool.query('UPDATE config SET last_synced_at=now() WHERE id=1');
+  res.json({ ok: true, newShows: newShowIds.length, showIds: newShowIds });
+});
+
+app.get('/api/shows/pending', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT sh.*, (SELECT sa.artist FROM show_artists sa WHERE sa.show_id=sh.id ORDER BY sa.billing_order NULLS LAST, sa.id LIMIT 1) AS headliner
+    FROM shows sh WHERE sh.stage != 'complete' ORDER BY sh.date
+  `)).rows;
+  res.json(rows);
+});
+
+// Full show list (including completed ones) so a mistake can be corrected
+// after the fact — the wizard itself is safe to re-run on a complete show.
+// Deletes a show entirely (cascades to its artists/songs/companions —
+// schema already has ON DELETE CASCADE set up for this). Use for genuine
+// mistakes/duplicates, not routine editing.
+app.delete('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
+  await pool.query('DELETE FROM shows WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+app.get('/api/shows/all', requireAuth, async (req, res) => {
+  const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
+  for (const sh of shows) {
+    sh.artists = (await pool.query(
+      `SELECT id, artist, billing_order, setlistfm_url, setlistfm_id, marked_attended FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id`,
+      [sh.id]
+    )).rows;
+    sh.headliner = sh.artists[0] ? sh.artists[0].artist : null;
+  }
+  res.json(shows);
+});
+
+// Manual fallback in case the automatic setlist.fm check below ever
+// misses a real match (e.g. a duplicate listing) — the real check is
+// primary, this is just an escape hatch.
+app.post('/api/show-artists/:id/mark-attended', requireAuth, async (req, res) => {
+  await pool.query('UPDATE show_artists SET marked_attended=true WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+app.post('/api/show-artists/:id/unmark-attended', requireAuth, async (req, res) => {
+  await pool.query('UPDATE show_artists SET marked_attended=false WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// Cached (10 min) list of setlist IDs you've marked "I Was There" on —
+// checked per-row against each show's matched setlist. Surfaces a clear
+// error (e.g. wrong username) instead of silently looking like zero.
+let attendedCache = { at: 0, ids: null, error: null };
+app.get('/api/setlistfm/attended-ids', requireAuth, async (req, res) => {
+  const force = req.query.force === 'true';
+  if (force || !attendedCache.ids || Date.now() - attendedCache.at > 10 * 60 * 1000) {
+    const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
+    if (!cfg.setlistfm_username) {
+      attendedCache = { at: Date.now(), ids: [], error: 'No setlist.fm username set in Settings.' };
+    } else {
+      try {
+        const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+        attendedCache = { at: Date.now(), ids: attended.map(a => a.id), error: null, sample: attended.slice(0, 8).map(a => ({ id: a.id, artist: a.artist ? a.artist.name : '?', date: a.eventDate, venue: a.venue ? a.venue.name : '?' })) };
+      } catch (e) {
+        attendedCache = { at: Date.now(), ids: [], error: e.message, sample: [] };
+      }
+    }
+  }
+  res.json({ ids: attendedCache.ids, error: attendedCache.error });
+});
+
+// Diagnostic only — shows exactly what the attended fetch returned (raw
+// count + a sample with real artist/date/venue), plus every currently
+// matched show's stored setlistfm_id, so a mismatch is actually visible
+// instead of guessed at.
+app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT setlistfm_username FROM config WHERE id=1')).rows[0];
+  if (!cfg.setlistfm_username) return res.json({ error: 'No setlist.fm username set.' });
+  try {
+    const attended = await setlistfm.getAttendedShows(cfg.setlistfm_username);
+    const matched = (await pool.query(`SELECT artist, setlistfm_id, setlistfm_url FROM show_artists WHERE setlistfm_id IS NOT NULL ORDER BY id`)).rows;
+    let artistLookup = null;
+    if (req.query.artist) {
+      artistLookup = (await pool.query(
+        `SELECT sa.artist, sa.setlistfm_checked, sa.setlistfm_id, sa.setlistfm_url, sa.marked_attended, sh.date, sh.venue
+         FROM show_artists sa JOIN shows sh ON sh.id=sa.show_id
+         WHERE sa.artist ILIKE $1 ORDER BY sh.date DESC`,
+        [`%${req.query.artist}%`]
+      )).rows;
+    }
+    res.json({
+      username: cfg.setlistfm_username,
+      attendedCount: attended.length,
+      attendedSample: attended.slice(0, 10).map(a => ({ id: a.id, artist: a.artist ? a.artist.name : '?', date: a.eventDate, venue: a.venue ? a.venue.name : '?' })),
+      matchedShows: matched,
+      artistLookup,
+    });
+  } catch (e) {
+    res.json({ error: e.message, username: cfg.setlistfm_username });
+  }
+});
+
+app.get('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const show = (await pool.query('SELECT * FROM shows WHERE id=$1', [showId])).rows[0];
+  if (!show) return res.status(404).json({ error: 'Not found' });
+  const artists = (await pool.query('SELECT * FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id', [showId])).rows;
+  for (const a of artists) {
+    a.songs = (await pool.query(
+      `SELECT ss.*, s.title, s.artist, s.spotify_status, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
+       FROM show_songs ss JOIN songs s ON s.id = ss.song_id
+       WHERE ss.show_artist_id=$1 ORDER BY ss.play_order`, [a.id]
+    )).rows;
+    a.diff = computeSetlistDiff(a.original_setlist, a.songs.map(s => s.title));
+  }
+  const companions = (await pool.query(
+    `SELECT c.* FROM companions c JOIN show_companions sc ON sc.companion_id=c.id WHERE sc.show_id=$1`, [showId]
+  )).rows;
+  res.json({ ...show, artists, companions });
+});
+
+// Compares the current song order/composition against the original pull so
+// the tagging screen can show exactly what's actually been edited, instead
+// of leaving you to guess whether a swap or a cover exclusion is what made
+// the setlist "look" different.
+function computeSetlistDiff(original, current) {
+  if (!original) return null; // no baseline recorded (older data) — nothing to compare
+  const originalCounts = {};
+  original.forEach(t => { originalCounts[t] = (originalCounts[t] || 0) + 1; });
+  const currentCounts = {};
+  current.forEach(t => { currentCounts[t] = (currentCounts[t] || 0) + 1; });
+
+  const added = [];
+  for (const t of current) {
+    if ((currentCounts[t] > (originalCounts[t] || 0))) { added.push(t); currentCounts[t]--; }
+  }
+  const removed = [];
+  const remaining = { ...originalCounts };
+  current.forEach(t => { if (remaining[t] > 0) remaining[t]--; });
+  for (const t of original) {
+    if (remaining[t] > 0) { removed.push(t); remaining[t]--; }
+  }
+
+  const commonOriginalOrder = original.filter(t => current.includes(t));
+  const commonCurrentOrder = current.filter(t => original.includes(t));
+  const reordered = JSON.stringify(commonOriginalOrder) !== JSON.stringify(commonCurrentOrder);
+
+  return { added, removed, reordered, hasChanges: added.length > 0 || removed.length > 0 || reordered };
 }
 
-async function renderJourney() {
-  const data = await api(`/api/report/journey${companionsQuery()}`);
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>First 3 shows</h2>
-      ${data.first.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
-    </div>
-    <div class="card">
-      <h2>Latest 3 shows</h2>
-      ${data.latest.map(journeyShowCard).join('') || '<p class="muted">No shows yet.</p>'}
-    </div>
+// Reassigns play_order 1..N to match the given sequence — used by the
+// move-up/move-down controls in the tagging screen.
+app.post('/api/show-artists/:id/reorder', requireAuth, async (req, res) => {
+  const { orderedShowSongIds } = req.body;
+  for (let i = 0; i < orderedShowSongIds.length; i++) {
+    await pool.query('UPDATE show_songs SET play_order=$1 WHERE id=$2', [i + 1, orderedShowSongIds[i]]);
+  }
+  res.json({ ok: true });
+});
+
+// Lets the user add a song the setlist pull missed entirely (rare, but
+// happens) — same effect as one coming in from setlist.fm, just typed
+// instead of pulled, and still runs through the normal master-list match.
+app.post('/api/show-artists/:id/add-song', requireAuth, async (req, res) => {
+  const showArtistId = Number(req.params.id);
+  const { title } = req.body;
+  if (!title || !title.trim()) return res.status(400).json({ error: 'Song title is required' });
+  const artistRow = (await pool.query('SELECT artist FROM show_artists WHERE id=$1', [showArtistId])).rows[0];
+  if (!artistRow) return res.status(404).json({ error: 'Show artist not found' });
+  const maxOrder = (await pool.query('SELECT COALESCE(max(play_order),0) AS m FROM show_songs WHERE show_artist_id=$1', [showArtistId])).rows[0].m;
+  const song = await findOrCreateSong(artistRow.artist, title.trim());
+  const inserted = (await pool.query(
+    `INSERT INTO show_songs (show_artist_id, song_id, play_order) VALUES ($1,$2,$3) RETURNING id`,
+    [showArtistId, song.id, Number(maxOrder) + 1]
+  )).rows[0];
+  res.json({ ok: true, showSongId: inserted.id, title: song.title, playOrder: Number(maxOrder) + 1 });
+});
+
+// ---------- tagging ----------
+
+// Lets the user drop a specific song out of the dataset entirely — mainly
+// for live covers with no official Spotify release, which the sync pulls
+// in from setlist.fm alongside everything else so the user can review them.
+app.post('/api/show-songs/:id/remove', requireAuth, async (req, res) => {
+  await pool.query('DELETE FROM show_songs WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// For a song that shouldn't be in the dataset at all (not something that
+// belongs to one show, but genuinely never a real performed song — like
+// walk-off/outro music setlist.fm sometimes lists as part of a setlist).
+// Songs are shared across every show they appear at, so this finds and
+// removes every occurrence in one action instead of a show-by-show hunt.
+app.get('/api/songs/:id/occurrences', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT ss.id AS show_song_id, sh.date, sh.venue, sa.artist
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
+    WHERE ss.song_id = $1 ORDER BY sh.date
+  `, [Number(req.params.id)])).rows;
+  res.json({ occurrences: rows });
+});
+
+app.post('/api/songs/:id/remove-everywhere', requireAuth, async (req, res) => {
+  const songId = Number(req.params.id);
+  const result = await pool.query('DELETE FROM show_songs WHERE song_id=$1', [songId]);
+  res.json({ ok: true, removed: result.rowCount });
+});
+
+app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const { companionIds, newCompanionNames, originAddress, songs } = req.body;
+
+  for (const s of songs) {
+    await pool.query(
+      'UPDATE show_songs SET known=$1, liked_now=$2, status=$3 WHERE id=$4',
+      [s.known, s.likedNow, s.status, s.showSongId]
+    );
+  }
+
+  const allCompanionIds = [...(companionIds || [])];
+  for (const name of (newCompanionNames || [])) {
+    const existing = (await pool.query('SELECT id FROM companions WHERE name=$1', [name])).rows[0];
+    const id = existing ? existing.id : (await pool.query('INSERT INTO companions (name) VALUES ($1) RETURNING id', [name])).rows[0].id;
+    allCompanionIds.push(id);
+  }
+  await pool.query('DELETE FROM show_companions WHERE show_id=$1', [showId]);
+  for (const cid of allCompanionIds) {
+    await pool.query('INSERT INTO show_companions (show_id, companion_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [showId, cid]);
+  }
+
+  if (originAddress) {
+    const show = (await pool.query('SELECT origin_address, venue_lat, venue_lng, distance_miles, duration_minutes FROM shows WHERE id=$1', [showId])).rows[0];
+    const addressChanged = show.origin_address !== originAddress;
+    const dataMissing = show.distance_miles === null || show.duration_minutes === null;
+
+    if (!addressChanged && !dataMissing) {
+      // Nothing relevant changed — leave the existing (already-correct)
+      // travel data alone rather than re-running geocoding on every save.
+      await pool.query('UPDATE shows SET origin_address=$1 WHERE id=$2', [originAddress, showId]);
+    } else {
+      let originCoord = null;
+      let geocodeError = null;
+      try { originCoord = await ors.geocode(originAddress); } catch (e) { geocodeError = e.message; }
+      let distance = null;
+      if (originCoord && show.venue_lat && show.venue_lng) {
+        try { distance = await ors.drivingDistance(originCoord, { lat: show.venue_lat, lng: show.venue_lng }); } catch (e) { geocodeError = e.message; }
+      }
+      if (originCoord && distance) {
+        // A real result — safe to overwrite.
+        await pool.query(
+          `UPDATE shows SET origin_address=$1, origin_lat=$2, origin_lng=$3, distance_miles=$4, duration_minutes=$5 WHERE id=$6`,
+          [originAddress, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, showId]
+        );
+      } else {
+        // Geocoding failed this time — update the address text so it's not
+        // lost, but never blank out previously-good distance/duration with
+        // a failed attempt's null result.
+        await pool.query('UPDATE shows SET origin_address=$1 WHERE id=$2', [originAddress, showId]);
+      }
+    }
+  }
+
+  await pool.query(`UPDATE shows SET stage='tagged' WHERE id=$1`, [showId]);
+  res.json({ ok: true });
+});
+
+// Backs a show's review out to wherever it was before this editing session
+// started (usually 'new', but 'complete' if you were just fixing a mistake
+// on an already-finished show) — used when someone wants to abandon this
+// session's progress rather than push through to completion. Leaves
+// whatever flags/matches were already saved in place (harmless, re-editable
+// next time) — this only resets which step it's parked on.
+const VALID_STAGES = ['new', 'tagged', 'spotify_reviewed', 'complete'];
+app.post('/api/shows/:id/reset-stage', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  if (!Number.isFinite(showId)) return res.status(400).json({ error: 'Invalid show id' });
+  const stage = VALID_STAGES.includes(req.body.stage) ? req.body.stage : 'new';
+  await pool.query(`UPDATE shows SET stage=$1 WHERE id=$2`, [stage, showId]);
+  res.json({ ok: true, stage });
+});
+
+// Matches historical (spreadsheet-imported) shows to their real setlist.fm
+// entry by artist + exact date, which narrows results enough that a match
+// is usually unambiguous. This fills in tour_name and a link to the real
+// setlist.fm page — it does NOT and cannot mark "I was there" on your
+// setlist.fm account, since that's a website-only action with no API
+// equivalent; this only reads public setlist.fm data.
+app.post('/api/setlistfm/match-historical', requireAuth, async (req, res) => {
+  const limit = 25;
+  const rows = (await pool.query(`
+    SELECT sa.id, sa.artist, sh.date, sh.venue, sh.city
+    FROM show_artists sa JOIN shows sh ON sh.id = sa.show_id
+    WHERE sa.setlistfm_checked = false
+    ORDER BY sh.date
+    LIMIT $1
+  `, [limit])).rows;
+
+  const remainingRow = (await pool.query(`SELECT count(*) AS c FROM show_artists WHERE setlistfm_checked = false`)).rows[0];
+
+  let matched = 0, noMatch = 0;
+  const unmatched = [];
+
+  for (const row of rows) {
+    let candidates = [];
+    try {
+      const isoDate = new Date(row.date).toISOString().slice(0, 10);
+      candidates = await setlistfm.searchSetlistsByArtistAndDate(row.artist, isoDate);
+    } catch (e) { /* treat as no match, don't block the rest */ }
+    await ors.sleep(300);
+
+    // Date is already narrowed to the exact day; prefer a venue-name match
+    // among candidates for confidence, but fall back to the only/first
+    // result since same-artist-same-day is already a strong signal.
+    const venueLower = row.venue.toLowerCase();
+    const best = candidates.find(c => c.venue && c.venue.name && c.venue.name.toLowerCase().includes(venueLower.split(' ')[0]))
+      || candidates[0] || null;
+
+    if (best) {
+      await pool.query(
+        'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2, setlistfm_id=$3 WHERE id=$4',
+        [best.tour ? best.tour.name : null, best.url || null, best.id || null, row.id]
+      );
+      matched++;
+    } else {
+      await pool.query('UPDATE show_artists SET setlistfm_checked=true WHERE id=$1', [row.id]);
+      noMatch++;
+      unmatched.push({ id: row.id, artist: row.artist, date: row.date, venue: row.venue });
+    }
+  }
+
+  const stillRemaining = Number(remainingRow.c) - rows.length;
+  res.json({ ok: true, matched, noMatch, unmatched, remaining: Math.max(0, stillRemaining), done: rows.length < limit });
+});
+
+// Manual fallback for shows the automatic date+artist match couldn't
+// resolve — usually an opener whose setlist was never logged separately,
+// or an artist name that doesn't exactly match setlist.fm's listing. Lets
+// you search with an edited name and pick the right result yourself.
+app.post('/api/setlistfm/search', requireAuth, async (req, res) => {
+  const { artistName, date } = req.body;
+  try {
+    const candidates = date
+      ? await setlistfm.searchSetlistsByArtistAndDate(artistName, date)
+      : await setlistfm.searchSetlistsByArtist(artistName);
+    res.json(candidates.slice(0, 10).map(c => ({
+      id: c.id, url: c.url, date: c.eventDate,
+      venue: c.venue ? c.venue.name : '', city: c.venue && c.venue.city ? c.venue.city.name : '',
+      tour: c.tour ? c.tour.name : null,
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/setlistfm/manual-match/apply', requireAuth, async (req, res) => {
+  const { showArtistId, setlistId } = req.body;
+  try {
+    const setlist = await setlistfm.getSetlist(setlistId);
+    if (!setlist) return res.status(404).json({ error: 'Setlist not found' });
+    await pool.query(
+      'UPDATE show_artists SET setlistfm_checked=true, tour_name=$1, setlistfm_url=$2, setlistfm_id=$3 WHERE id=$4',
+      [setlist.tour ? setlist.tour.name : null, setlist.url || null, setlist.id, showArtistId]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- fill gaps ----------
+app.post('/api/shows/:id/fill-gap/search', requireAuth, async (req, res) => {
+  const { artistName } = req.body;
+  const results = await setlistfm.searchSetlistsByArtist(artistName);
+  res.json(results.map(r => ({
+    id: r.id,
+    date: r.eventDate,
+    venue: r.venue.name,
+    city: r.venue.city.name,
+    songCount: (r.sets && r.sets.set) ? r.sets.set.reduce((n, s) => n + (s.song ? s.song.length : 0), 0) : 0,
+  })));
+});
+
+app.post('/api/shows/:id/fill-gap/apply', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const { setlistId, showArtistId, artistName } = req.body;
+  const setlist = await setlistfm.getSetlist(setlistId);
+  if (!setlist) return res.status(404).json({ error: 'Could not fetch that setlist from setlist.fm — nothing was changed.' });
+  const songs = setlistfm.flattenSetlistSongs(setlist);
+  if (!songs.length) return res.status(400).json({ error: "That setlist has no songs listed on setlist.fm — nothing was changed, since replacing your set with an empty one isn't useful." });
+
+  await pool.query('DELETE FROM show_songs WHERE show_artist_id=$1', [showArtistId]);
+  let order = 1;
+  for (const s of songs) {
+    const song = await findOrCreateSong(artistName, s.name);
+    await pool.query(
+      'INSERT INTO show_songs (show_artist_id, song_id, play_order, is_cover) VALUES ($1,$2,$3,$4)',
+      [showArtistId, song.id, order++, s.isCover]
+    );
+  }
+  // This is a deliberate wholesale replacement, not an ad-hoc edit — reset
+  // the diff baseline to the new pull so later small edits (a swap, a
+  // reorder) don't get misread as "most of the setlist was removed."
+  const sourceLabel = `replaced from ${setlist.eventDate} at ${setlist.venue.name}`;
+  await pool.query(
+    'UPDATE show_artists SET original_setlist=$1, setlist_source=$2, tour_name=$3 WHERE id=$4',
+    [JSON.stringify(songs.map(s => s.name)), sourceLabel, setlist.tour ? setlist.tour.name : null, showArtistId]
+  );
+  res.json({ ok: true, songCount: songs.length });
+});
+
+app.post('/api/spotify/search', requireAuth, async (req, res) => {
+  const { query, artist } = req.body;
+  if (!query) return res.status(400).json({ error: 'query is required' });
+  try {
+    const results = await spotify.searchTrack(query, artist || '');
+    res.json(results);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Spotify match review ----------
+app.get('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const rows = (await pool.query(
+    `SELECT s.id, s.artist, s.title, s.spotify_status, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url,
+       array_agg(ss.id) AS show_song_ids, min(sa.billing_order) AS billing_order, min(ss.play_order) AS play_order
+     FROM songs s JOIN show_songs ss ON ss.song_id=s.id JOIN show_artists sa ON sa.id=ss.show_artist_id
+     WHERE sa.show_id=$1
+     GROUP BY s.id, s.artist, s.title, s.spotify_status, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
+     ORDER BY billing_order NULLS LAST, s.artist, play_order`, [showId]
+  )).rows;
+
+  const out = [];
+  for (const song of rows) {
+    if (song.spotify_status === 'pending') {
+      let candidates = [];
+      let searchError = null;
+      try { candidates = await spotify.searchTrack(song.title, song.artist); }
+      catch (e) { searchError = e.message; }
+      const best = candidates[0];
+      out.push({ songId: song.id, showSongIds: song.show_song_ids, artist: song.artist, title: song.title, status: 'pending', candidates, suggested: best || null, searchError });
+    } else {
+      out.push({
+        songId: song.id, showSongIds: song.show_song_ids, artist: song.artist, title: song.title, status: song.spotify_status,
+        current: song.spotify_track_id ? { id: song.spotify_track_id, name: song.spotify_track_name, albumName: song.spotify_album_name, albumArtUrl: song.spotify_album_art_url } : null,
+      });
+    }
+  }
+  res.json(out);
+});
+
+app.post('/api/shows/:id/spotify-review', requireAuth, async (req, res) => {
+  const { decisions } = req.body; // [{songId, action: 'approve'|'select'|'exclude', track?}]
+  for (const d of decisions) {
+    const current = (await pool.query('SELECT spotify_track_id FROM songs WHERE id=$1', [d.songId])).rows[0];
+    const newTrackId = d.action === 'exclude' ? null : (d.track && d.track.id);
+    const changingTrack = current && current.spotify_track_id && current.spotify_track_id !== newTrackId;
+
+    if (changingTrack) {
+      // This song's match is shared across every show it appears in — pull
+      // the old track out of anywhere it was already pushed, everywhere,
+      // then let it get re-added fresh under the new match.
+      const targets = [
+        { key: 'seen', playlistId: (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0].seen_playlist_id },
+      ];
+      const cfg = (await pool.query('SELECT wes_playlist_id, dad_playlist_id FROM config WHERE id=1')).rows[0];
+      targets.push({ key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) }, { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) });
+      const affected = (await pool.query('SELECT id, added_to_seen, added_to_wes, added_to_dad FROM show_songs WHERE song_id=$1', [d.songId])).rows;
+      for (const t of targets) {
+        if (affected.some(r => r[`added_to_${t.key}`])) {
+          try { await spotify.removeTracksFromPlaylist(t.playlistId, [`spotify:track:${current.spotify_track_id}`]); } catch (e) {}
+        }
+      }
+      await pool.query('UPDATE show_songs SET added_to_seen=false, added_to_wes=false, added_to_dad=false WHERE song_id=$1', [d.songId]);
+    }
+
+    if (d.action === 'exclude') {
+      await pool.query(`UPDATE songs SET spotify_status='excluded' WHERE id=$1`, [d.songId]);
+    } else if (d.action === 'approve' || d.action === 'select') {
+      const t = d.track;
+      await pool.query(
+        `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+        [t.id, t.name, t.albumName, t.albumArtUrl, d.songId]
+      );
+    }
+  }
+  await pool.query(`UPDATE shows SET stage='spotify_reviewed' WHERE id=$1`, [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// ---------- playlist submit ----------
+async function playlistTargets(showId) {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const companions = (await pool.query(
+    `SELECT c.name FROM companions c JOIN show_companions sc ON sc.companion_id=c.id WHERE sc.show_id=$1`, [showId]
+  )).rows.map(r => r.name);
+  const targets = [{ key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) }];
+  if (companions.includes('Wes')) targets.push({ key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) });
+  if (companions.includes('Jeff')) targets.push({ key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) });
+  return targets;
+}
+
+app.get('/api/shows/:id/playlist-preview', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const targets = await playlistTargets(showId);
+  const songs = (await pool.query(
+    `SELECT ss.id AS show_song_id, s.id AS song_id, s.title, s.artist, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url, s.spotify_status, ss.added_to_seen, ss.added_to_wes, ss.added_to_dad
+     FROM show_songs ss JOIN songs s ON s.id=ss.song_id JOIN show_artists sa ON sa.id=ss.show_artist_id
+     WHERE sa.show_id=$1 AND s.spotify_status IN ('matched','assumed_added')`, [showId]
+  )).rows;
+  res.json({ targets, songs });
+});
+
+app.post('/api/shows/:id/playlist-submit', requireAuth, async (req, res) => {
+  const showId = Number(req.params.id);
+  const { drops, skipSync } = req.body; // drops: [showSongId]
+  const targets = await playlistTargets(showId);
+
+  // A dropped song that had already made it into a playlist needs to come
+  // back out, not just stop being tracked.
+  const dropIds = (drops || []).map(Number).filter(Number.isFinite);
+  if (dropIds.length) {
+    const droppedRows = (await pool.query(
+      `SELECT ss.id, ss.added_to_seen, ss.added_to_wes, ss.added_to_dad, s.spotify_track_id
+       FROM show_songs ss JOIN songs s ON s.id=ss.song_id WHERE ss.id = ANY($1::int[])`, [dropIds]
+    )).rows;
+    if (!skipSync) {
+      for (const row of droppedRows) {
+        if (!row.spotify_track_id) continue;
+        for (const target of targets) {
+          if (row[`added_to_${target.key}`]) {
+            try { await spotify.removeTracksFromPlaylist(target.playlistId, [`spotify:track:${row.spotify_track_id}`]); } catch (e) {}
+          }
+        }
+      }
+    }
+    await pool.query(`UPDATE show_songs SET added_to_seen=false, added_to_wes=false, added_to_dad=false WHERE id = ANY($1::int[])`, [dropIds]);
+  }
+
+  if (skipSync) {
+    // Dataset changes are saved (above), but nothing gets pushed to Spotify.
+    // Leaving added_to_* flags as-is means anything genuinely out of sync
+    // will surface again on its own via "Playlist updates needed."
+    await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
+    return res.json({ ok: true, added: 0, skipped: true });
+  }
+
+  const songs = (await pool.query(
+    `SELECT ss.id AS show_song_id, s.spotify_track_id, ss.added_to_seen, ss.added_to_wes, ss.added_to_dad
+     FROM show_songs ss JOIN songs s ON s.id=ss.song_id JOIN show_artists sa ON sa.id=ss.show_artist_id
+     WHERE sa.show_id=$1 AND s.spotify_status IN ('matched','assumed_added') AND s.spotify_track_id IS NOT NULL`, [showId]
+  )).rows;
+  const dropSet = new Set(dropIds.map(String));
+  const keep = songs.filter(s => !dropSet.has(String(s.show_song_id)));
+
+  let added = 0;
+  for (const target of targets) {
+    const flagCol = `added_to_${target.key}`;
+    // Only the songs actually missing this specific playlist get pushed —
+    // already-added songs are left alone, not resent.
+    const toAdd = keep.filter(s => !s[flagCol]);
+    const uris = toAdd.map(s => `spotify:track:${s.spotify_track_id}`);
+    await spotify.addTracksToPlaylist(target.playlistId, uris);
+    added += toAdd.length;
+    for (const s of toAdd) {
+      await pool.query(`UPDATE show_songs SET ${flagCol}=true WHERE id=$1`, [s.show_song_id]);
+    }
+  }
+
+  await pool.query(`UPDATE shows SET stage='complete' WHERE id=$1`, [showId]);
+  res.json({ ok: true, added });
+});
+
+// ---------- reports ----------
+
+// A song counts as a genuine "regret" only if you have NEVER known it at any
+// show you've seen it at. If you later saw the same song again and knew it
+// that time, none of its occurrences count as a regret anymore.
+const REGRET_SQL = `(NOT ss.known AND ss.liked_now AND NOT EXISTS (
+  SELECT 1 FROM show_songs ss2 WHERE ss2.song_id = ss.song_id AND ss2.known = true
+))`;
+
+// Attendee filter: ?companions=1,2,3 on any report endpoint. Absent or
+// "all" means no filtering (every show included).
+function companionIdsParam(req) {
+  const raw = req.query.companions;
+  if (!raw || raw === 'all') return null;
+  const ids = String(raw).split(',').map(Number).filter(Number.isFinite);
+  return ids.length ? ids : null;
+}
+
+// Best-effort city extraction from a free-text "Street, City, ST ZIP"
+// (or "City, ST ZIP") address string, for the "traveled from" column.
+function extractCity(address) {
+  if (!address) return null;
+  const parts = String(address).split(',').map(p => p.trim()).filter(Boolean);
+  if (parts.length >= 2) return parts[parts.length - 2];
+  return parts[0] || null;
+}
+
+function orderLabel(order, max) {
+  if (order == null) return 'Headliner';
+  if (max == null || order === 1) return `${order} — Headliner`;
+  if (order === max) return `${order} — Opener`;
+  return `${order} — Support`;
+}
+
+// Shared show→artist→song tree builder used by both Overview and Journey.
+// Pass cIds (attendee filter, or null for all) and/or an explicit showIds
+// list (used by Journey to pull specific shows regardless of the filter).
+async function getShowsNested({ cIds = null, showIds = null } = {}) {
+  const params = [cIds, showIds];
+  const where = `
+    ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+    AND ($2::int[] IS NULL OR sh.id = ANY($2::int[]))
   `;
+
+  const showRows = (await pool.query(
+    `SELECT sh.id, sh.date, sh.venue, sh.city, sh.state, sh.origin_address FROM shows sh WHERE ${where} ORDER BY sh.date`,
+    params
+  )).rows;
+
+  const artistRows = (await pool.query(`
+    SELECT sa.id AS show_artist_id, sa.show_id, sa.artist, sa.billing_order,
+      count(ss.id) AS song_count,
+      round(100.0 * sum(CASE WHEN ss.known THEN 1 ELSE 0 END) / NULLIF(count(*),0), 0) AS pct_known,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer,
+      (SELECT max(billing_order) FROM show_artists sa2 WHERE sa2.show_id = sa.show_id) AS max_billing
+    FROM show_artists sa
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN show_songs ss ON ss.show_artist_id = sa.id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ${where}
+    GROUP BY sa.id
+  `, params)).rows;
+
+  const songRows = (await pool.query(`
+    SELECT sa.id AS show_artist_id, s.title, ss.known, (ss.status='missed') AS missed,
+      ${REGRET_SQL} AS regret, ss.play_order
+    FROM show_songs ss
+    JOIN show_artists sa ON sa.id = ss.show_artist_id
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ${where}
+    ORDER BY ss.play_order
+  `, params)).rows;
+
+  const songsByArtist = {};
+  for (const r of songRows) (songsByArtist[r.show_artist_id] = songsByArtist[r.show_artist_id] || []).push(r);
+
+  const artistsByShow = {};
+  for (const a of artistRows) {
+    (artistsByShow[a.show_id] = artistsByShow[a.show_id] || []).push({
+      showArtistId: a.show_artist_id,
+      artist: a.artist,
+      billingOrder: a.billing_order,
+      orderLabel: orderLabel(a.billing_order, a.max_billing),
+      songCount: Number(a.song_count),
+      pctKnown: a.pct_known == null ? 0 : Number(a.pct_known),
+      opener: a.opener,
+      closer: a.closer,
+      songs: (songsByArtist[a.show_artist_id] || []).map(s => ({ title: s.title, known: s.known, missed: s.missed, regret: s.regret })),
+    });
+  }
+
+  return showRows.map(sh => {
+    const artists = (artistsByShow[sh.id] || []).slice().sort((x, y) => (x.billingOrder ?? 1) - (y.billingOrder ?? 1));
+    const headliner = artists.find(a => a.billingOrder === 1 || a.billingOrder == null) || artists[0];
+    return {
+      id: sh.id,
+      date: sh.date,
+      venue: sh.venue,
+      city: sh.city,
+      state: sh.state,
+      headliner: headliner ? headliner.artist : '—',
+      location: [sh.city, sh.state].filter(Boolean).join(', '),
+      traveledFrom: extractCity(sh.origin_address),
+      artists,
+    };
+  });
 }
 
-function journeyShowCard(sh) {
-  return `
-    <div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--line);">
-      <div style="font-weight:600;">${new Date(sh.date).toLocaleDateString()} — ${sh.venue}</div>
-      <div class="muted" style="margin-bottom:6px;">${[sh.city, sh.state].filter(Boolean).join(', ')}</div>
-      ${sh.artists.map(a => `<div class="muted" style="white-space:nowrap;overflow-x:auto;">${a.orderLabel}: <span style="color:var(--text);">${a.artist}</span> — Opener: ${a.opener || '—'} · Closer: ${a.closer || '—'}</div>`).join('')}
-    </div>
-  `;
+app.get('/api/report/overview', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+
+  const totals = (await pool.query(`
+    SELECT count(DISTINCT sh.id) AS shows, count(DISTINCT sa.artist) AS unique_artists, count(DISTINCT ss.song_id) AS unique_songs,
+      round(100.0 * sum(CASE WHEN ss.known THEN 1 ELSE 0 END) / NULLIF(count(*),0), 1) AS pct_known
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id
+    WHERE ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+  `, [cIds])).rows[0];
+
+  const shows = await getShowsNested({ cIds });
+  res.json({ totals, shows });
+});
+
+app.get('/api/report/trends', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+
+  async function bucketedCounts(bucketExpr) {
+    return (await pool.query(`
+      SELECT ${bucketExpr} AS bucket, count(DISTINCT sh.id) AS shows,
+        count(DISTINCT sa.artist) AS artists, count(DISTINCT ss.song_id) AS songs, count(DISTINCT sh.venue) AS venues
+      FROM shows sh
+      JOIN show_artists sa ON sa.show_id = sh.id
+      JOIN show_songs ss ON ss.show_artist_id = sa.id
+      WHERE ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+      GROUP BY 1 ORDER BY 1
+    `, [cIds])).rows;
+  }
+
+  const byYear = await bucketedCounts('extract(year FROM sh.date)::int');
+  const byMonth = await bucketedCounts('extract(month FROM sh.date)::int');
+  const bySeasonRaw = await bucketedCounts(`CASE
+    WHEN extract(month FROM sh.date) IN (3,4,5) THEN 'Spring'
+    WHEN extract(month FROM sh.date) IN (6,7,8) THEN 'Summer'
+    WHEN extract(month FROM sh.date) IN (9,10,11) THEN 'Fall'
+    ELSE 'Winter' END`);
+  const byWeekday = await bucketedCounts('extract(dow FROM sh.date)::int');
+
+  const seasonOrder = ['Spring', 'Summer', 'Fall', 'Winter'];
+  const bySeason = seasonOrder.map(s => bySeasonRaw.find(r => r.bucket === s)).filter(Boolean);
+
+  res.json({ byYear, byMonth, bySeason, byWeekday });
+});
+
+app.get('/api/report/travel', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+  const filterClause = `($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))`;
+
+  const totals = (await pool.query(
+    `SELECT sum(distance_miles) AS miles, sum(duration_minutes)/60.0 AS hours FROM shows sh WHERE ${filterClause}`,
+    [cIds]
+  )).rows[0];
+
+  const local = (await pool.query(`
+    SELECT venue, count(*) AS show_count
+    FROM shows sh
+    WHERE (state ILIKE 'Georgia' OR state ILIKE 'GA') AND ${filterClause}
+    GROUP BY venue ORDER BY show_count DESC, venue ASC
+  `, [cIds])).rows;
+
+  const travel = (await pool.query(`
+    SELECT sh.id, sh.venue, sh.city, sh.state, sh.distance_miles, sh.duration_minutes,
+      (SELECT string_agg(sa.artist, ', ' ORDER BY COALESCE(sa.billing_order, 1)) FROM show_artists sa WHERE sa.show_id = sh.id) AS bands
+    FROM shows sh
+    WHERE NOT (state ILIKE 'Georgia' OR state ILIKE 'GA') AND ${filterClause}
+    ORDER BY sh.distance_miles DESC NULLS LAST
+  `, [cIds])).rows;
+
+  res.json({ totals, local, travel });
+});
+
+app.get('/api/report/superlatives', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+  const filterClause = `($1::int[] IS NULL OR sa.show_id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))`;
+
+  const perShow = (await pool.query(`
+    SELECT sa.artist, sa.show_id,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer,
+      (sa.billing_order = 1) AS is_headliner_appearance
+    FROM show_artists sa
+    JOIN show_songs ss ON ss.show_artist_id = sa.id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ${filterClause}
+    GROUP BY sa.artist, sa.show_id, sa.billing_order
+  `, [cIds])).rows;
+
+  const songCounts = (await pool.query(`
+    SELECT sa.artist, count(DISTINCT ss.song_id) AS unique_songs, count(*) AS total_slots
+    FROM show_artists sa JOIN show_songs ss ON ss.show_artist_id = sa.id
+    WHERE ${filterClause}
+    GROUP BY sa.artist
+  `, [cIds])).rows;
+  const songCountByArtist = Object.fromEntries(songCounts.map(r => [r.artist, r]));
+
+  const byArtist = {};
+  for (const r of perShow) {
+    const a = byArtist[r.artist] = byArtist[r.artist] || { artist: r.artist, timesSeen: 0, headlineCount: 0, openers: new Set(), closers: new Set() };
+    a.timesSeen++;
+    if (r.is_headliner_appearance) a.headlineCount++;
+    a.openers.add(r.opener);
+    a.closers.add(r.closer);
+  }
+
+  const bandsSeenMost = Object.values(byArtist).map(a => {
+    const sc = songCountByArtist[a.artist] || { unique_songs: 0, total_slots: 0 };
+    const openCloseVariationPct = Math.round(100 * ((a.openers.size + a.closers.size) / (2 * a.timesSeen)) * 10) / 10;
+    return {
+      artist: a.artist,
+      timesSeen: a.timesSeen,
+      songCount: Number(sc.total_slots),
+      pctHeadline: Math.round(100 * a.headlineCount / a.timesSeen * 10) / 10,
+      setlistVariationPct: sc.total_slots ? Math.round(100 * sc.unique_songs / sc.total_slots * 10) / 10 : 0,
+      openCloseVariationPct,
+    };
+  }).sort((a, b) => b.timesSeen - a.timesSeen).slice(0, 10);
+
+  const repeatArtists = Object.values(byArtist).filter(a => a.timesSeen > 1);
+
+  // "Most new songs vs. the immediately-preceding time you saw them" — for
+  // each artist you've seen more than once, compare every show to the one
+  // right before it chronologically (show 2 vs show 1, show 3 vs show 2,
+  // etc.) and take that artist's single biggest new-song count from any one
+  // of those comparisons.
+  const artistShowSongs = (await pool.query(`
+    SELECT sa.artist, sh.date, array_agg(DISTINCT ss.song_id) AS song_ids
+    FROM show_artists sa
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN show_songs ss ON ss.show_artist_id = sa.id
+    WHERE ${filterClause}
+    GROUP BY sa.artist, sh.date
+    ORDER BY sa.artist, sh.date
+  `, [cIds])).rows;
+  const showsByArtist = {};
+  for (const r of artistShowSongs) (showsByArtist[r.artist] = showsByArtist[r.artist] || []).push(r.song_ids.map(Number));
+  const mostUniqueSongsRepeat = repeatArtists.map(a => {
+    const shows = showsByArtist[a.artist] || [];
+    let best = 0;
+    for (let i = 1; i < shows.length; i++) {
+      const prevSet = new Set(shows[i - 1]);
+      const newCount = shows[i].filter(id => !prevSet.has(id)).length;
+      if (newCount > best) best = newCount;
+    }
+    return { artist: a.artist, timesSeen: a.timesSeen, newSongsInASet: best };
+  }).sort((a, b) => b.newSongsInASet - a.newSongsInASet).slice(0, 5);
+
+  const mostOpenCloseVariation = repeatArtists.map(a => ({
+    artist: a.artist,
+    timesSeen: a.timesSeen,
+    openCloseVariationPct: Math.round(100 * ((a.openers.size + a.closers.size) / (2 * a.timesSeen)) * 10) / 10,
+  })).sort((a, b) => b.openCloseVariationPct - a.openCloseVariationPct).slice(0, 5);
+
+  const mostSongsInSet = (await pool.query(`
+    SELECT sh.date, sa.artist, count(*) AS song_count
+    FROM shows sh JOIN show_artists sa ON sa.show_id = sh.id JOIN show_songs ss ON ss.show_artist_id = sa.id
+    WHERE ${filterClause}
+    GROUP BY sh.date, sa.artist, sa.id
+    ORDER BY song_count DESC LIMIT 10
+  `, [cIds])).rows.map(r => ({ date: r.date, artist: r.artist, songCount: Number(r.song_count) }));
+
+  res.json({ bandsSeenMost, mostUniqueSongsRepeat, mostOpenCloseVariation, mostSongsInSet });
+});
+
+// Drilldown detail behind each superlatives row.
+app.get('/api/superlatives/drilldown/bands-seen/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url, count(ss.id) AS song_count,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer,
+      (SELECT sa2.artist FROM show_artists sa2 WHERE sa2.show_id=sh.id ORDER BY sa2.billing_order NULLS LAST, sa2.id LIMIT 1) AS headliner
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue, sh.city, sh.state, sa.tour_name, sa.setlistfm_url ORDER BY sh.date
+  `, [req.params.artist])).rows;
+  res.json(rows);
+});
+
+app.get('/api/superlatives/drilldown/set/:date/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT s.title, ss.play_order, ss.known
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sh.date=$1 AND sa.artist=$2 ORDER BY ss.play_order
+  `, [req.params.date, req.params.artist])).rows;
+  res.json(rows);
+});
+
+app.get('/api/superlatives/drilldown/open-close/:artist', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT sh.date, sh.venue,
+      (array_agg(s.title ORDER BY ss.play_order ASC))[1] AS opener,
+      (array_agg(s.title ORDER BY ss.play_order DESC))[1] AS closer
+    FROM shows sh JOIN show_artists sa ON sa.show_id=sh.id JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue ORDER BY sh.date
+  `, [req.params.artist])).rows;
+  res.json(rows);
+});
+
+// The side-by-side comparison: finds the specific consecutive pair of shows
+// that produced this artist's "most new songs" number, and returns both
+// setlists lined up — overlapping songs first (matched row to row), then
+// each show's songs that didn't appear in the other.
+app.get('/api/superlatives/drilldown/repeat-compare/:artist', requireAuth, async (req, res) => {
+  const artist = req.params.artist;
+  const shows = (await pool.query(`
+    SELECT sh.id, sh.date, sh.venue, array_agg(DISTINCT ss.song_id) AS song_ids
+    FROM show_artists sa JOIN shows sh ON sh.id=sa.show_id JOIN show_songs ss ON ss.show_artist_id=sa.id
+    WHERE sa.artist=$1 GROUP BY sh.id, sh.date, sh.venue ORDER BY sh.date
+  `, [artist])).rows;
+
+  let best = null;
+  for (let i = 1; i < shows.length; i++) {
+    const prevSet = new Set(shows[i - 1].song_ids.map(Number));
+    const newCount = shows[i].song_ids.map(Number).filter(id => !prevSet.has(id)).length;
+    if (!best || newCount > best.newCount) best = { prev: shows[i - 1], curr: shows[i], newCount };
+  }
+  if (!best) return res.json(null);
+
+  async function songsFor(showId) {
+    return (await pool.query(`
+      SELECT s.title, s.id AS song_id, ss.play_order
+      FROM show_artists sa JOIN show_songs ss ON ss.show_artist_id=sa.id JOIN songs s ON s.id=ss.song_id
+      WHERE sa.show_id=$1 AND sa.artist=$2 ORDER BY ss.play_order
+    `, [showId, artist])).rows;
+  }
+  const prevSongs = await songsFor(best.prev.id);
+  const currSongs = await songsFor(best.curr.id);
+  const prevIds = new Set(prevSongs.map(s => s.song_id));
+  const currIds = new Set(currSongs.map(s => s.song_id));
+
+  const overlap = currSongs.filter(s => prevIds.has(s.song_id)).map(s => s.title);
+  const prevOnly = prevSongs.filter(s => !currIds.has(s.song_id)).map(s => s.title);
+  const currOnly = currSongs.filter(s => !prevIds.has(s.song_id)).map(s => s.title);
+
+  res.json({
+    prevShow: { date: best.prev.date, venue: best.prev.venue },
+    currShow: { date: best.curr.date, venue: best.curr.venue },
+    overlap, prevOnly, currOnly,
+  });
+});
+
+app.get('/api/report/journey', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+  const filterClause = `($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))`;
+
+  const firstIds = (await pool.query(
+    `SELECT id FROM shows sh WHERE ${filterClause} ORDER BY date ASC, id ASC LIMIT 3`, [cIds]
+  )).rows.map(r => r.id);
+  const lastIds = (await pool.query(
+    `SELECT id FROM shows sh WHERE ${filterClause} ORDER BY date DESC, id DESC LIMIT 3`, [cIds]
+  )).rows.map(r => r.id);
+
+  const allShows = await getShowsNested({ cIds, showIds: [...firstIds, ...lastIds] });
+  const byId = Object.fromEntries(allShows.map(s => [s.id, s]));
+
+  res.json({
+    first: firstIds.map(id => byId[id]).filter(Boolean),
+    latest: lastIds.map(id => byId[id]).filter(Boolean),
+  });
+});
+
+app.get('/api/report/unknowns', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+  const filterClause = `($1::int[] IS NULL OR sa.show_id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))`;
+
+  const totals = (await pool.query(`
+    SELECT round(100.0*sum(CASE WHEN ss.known THEN 1 ELSE 0 END)/NULLIF(count(*),0),1) AS pct_known,
+      round(100.0*sum(CASE WHEN ss.status='missed' THEN 1 ELSE 0 END)/NULLIF(count(*),0),1) AS pct_missed,
+      round(100.0*sum(CASE WHEN ss.status='skipped' THEN 1 ELSE 0 END)/NULLIF(count(*),0),1) AS pct_skipped,
+      sum(CASE WHEN ${REGRET_SQL} THEN 1 ELSE 0 END) AS regret_count
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id
+    WHERE ${filterClause}
+  `, [cIds])).rows[0];
+
+  const songs = (await pool.query(`
+    SELECT s.artist, s.title, bool_or(${REGRET_SQL}) AS regret,
+      (array_agg(sh.date ORDER BY sh.date ASC))[1] AS date,
+      (array_agg(sh.venue ORDER BY sh.date ASC))[1] AS venue
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id=ss.song_id JOIN shows sh ON sh.id = sa.show_id
+    WHERE NOT ss.known AND ${filterClause}
+      AND NOT EXISTS (SELECT 1 FROM show_songs ss2 WHERE ss2.song_id = ss.song_id AND ss2.known = true)
+    GROUP BY s.id, s.artist, s.title
+    ORDER BY regret DESC, s.artist ASC, s.title ASC
+    LIMIT 500
+  `, [cIds])).rows;
+
+  res.json({ totals, songs });
+});
+
+// Songs you've seen live that never made it into a Spotify playlist:
+// - legacy (pre-app) shows, using the "already on Spotify" flag from the
+//   historical import directly
+// - shows synced through the app, where no valid Spotify match was ever
+//   found/approved during review, so it was marked excluded. (Covers with
+//   no official release get dropped at tagging time via the Remove button,
+//   so anything that reaches here already passed the user's own judgment
+//   call on whether it belongs in the dataset.)
+app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
+  const cIds = companionIdsParam(req);
+  const rows = (await pool.query(`
+    SELECT artist, title FROM (
+      SELECT s.artist, s.title
+      FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN shows sh ON sh.id = sa.show_id
+      JOIN songs s ON s.id = ss.song_id
+      WHERE sh.setlistfm_event_id IS NULL
+        AND ss.already_on_spotify = false
+        AND ss.status = 'seen'
+        AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+      UNION
+      SELECT s.artist, s.title
+      FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN shows sh ON sh.id = sa.show_id
+      JOIN songs s ON s.id = ss.song_id
+      WHERE sh.setlistfm_event_id IS NOT NULL
+        AND s.spotify_status = 'excluded'
+        AND ss.status = 'seen'
+        AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+    ) gaps
+    ORDER BY artist ASC, title ASC
+  `, [cIds])).rows;
+  res.json({ songs: rows });
+});
+
+// Re-searches every song that isn't yet tied to a real Spotify track ID —
+// this includes historical rows your spreadsheet marked "already on
+// Spotify" (assumed_added), since being marked that way never actually
+// searched for or recorded which track it corresponds to. Wherever a match
+// now exists, checks it against what's ACTUALLY in each of the three real
+// playlists (not just this app's own added_to_* bookkeeping) before
+// deciding what to do: if it's already sitting in a playlist, that just
+// means the app's records were stale — record the real track ID and move
+// on, no Spotify write. If it's genuinely missing, surface it for you to
+// approve on the Sync page. Missed/chose-not-to-see songs are excluded.
+// Simple in-memory cache so a multi-batch gap-check run doesn't re-fetch
+// each playlist's full track list from Spotify on every single batch —
+// that redundant work was the main reason this got slow. Cache lives for
+// 10 minutes, long enough to cover one full run.
+let playlistCache = { at: 0, sets: null };
+async function getCachedPlaylistIdSets(targetDefs) {
+  if (playlistCache.sets && Date.now() - playlistCache.at < 10 * 60 * 1000) return playlistCache.sets;
+  const sets = {};
+  for (const t of targetDefs) {
+    try { sets[t.key] = await spotify.getPlaylistTrackIds(t.playlistId); }
+    catch (e) { sets[t.key] = new Set(); }
+  }
+  playlistCache = { at: Date.now(), sets };
+  return sets;
 }
 
-async function renderUnknowns() {
-  const data = await api(`/api/report/unknowns${companionsQuery()}`);
-  const t = data.totals;
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>Unknowns</h2>
-      <div class="stat-grid" style="margin-bottom:16px;">
-        <div class="stat-tile"><div class="num">${t.pct_known || 0}%</div><div class="label">Known</div></div>
-        <div class="stat-tile"><div class="num">${t.pct_missed || 0}%</div><div class="label">Missed</div></div>
-        <div class="stat-tile"><div class="num">${t.pct_skipped || 0}%</div><div class="label">Skipped</div></div>
-        <div class="stat-tile"><div class="num">${fmt(t.regret_count || 0)}</div><div class="label">Regret</div></div>
-      </div>
-      <table>
-        <tr><th>Date</th><th>Venue</th><th>Artist</th><th>Song</th><th>Regret</th></tr>
-        ${data.songs.map(s => `<tr><td>${new Date(s.date).toLocaleDateString()}</td><td>${s.venue}</td><td>${s.artist}</td><td>${s.title}</td><td>${s.regret ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td class="muted">None.</td></tr>'}
-      </table>
-    </div>
-  `;
+// Queries the database directly for how many songs actually have a real
+// Spotify track tied to them right now — a persistent, always-checkable
+// number, independent of any single gap-check run's progress message
+// (which is ephemeral and only reflects that one run).
+// The right first step for the historical backlog: instead of searching
+// Spotify's whole catalog per song (slow, quota-hungry, and picks a version
+// you didn't choose), fetch your actual playlists once and match locally
+// against what you've already curated. A match here needs no approval —
+// it's not a new decision, just recognizing a song that's already exactly
+// where you put it. Only songs that genuinely aren't in any playlist yet
+// need the real catalog-search flow (gap-check) afterward.
+// Cached (10 min) per-playlist lookup maps, built from a full track fetch —
+// expensive to build once, so batches reuse it instead of re-fetching your
+// whole playlist on every chunk.
+let playlistLookupCache = { at: 0, lookups: null };
+async function getCachedPlaylistLookups(targetDefs) {
+  if (playlistLookupCache.lookups && Date.now() - playlistLookupCache.at < 10 * 60 * 1000) return playlistLookupCache;
+  const lookups = {};
+  const failures = [];
+  for (const t of targetDefs) {
+    try {
+      const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
+      const map = new Map();
+      for (const track of tracks) {
+        const normTitle = normalizeTitle(track.name);
+        for (const artistName of track.artists) {
+          map.set(`${artistKey(artistName)}|${normTitle}`, track);
+        }
+      }
+      lookups[t.key] = map;
+    } catch (e) {
+      // One playlist failing (wrong ID, belongs to a different account,
+      // whatever it turns out to be) shouldn't block matching against the
+      // others — this used to abort the whole operation on any single
+      // failure, which is exactly what made a Wes/Dad playlist problem
+      // silently block Seen In Concert too.
+      failures.push({ key: t.key, error: e.message });
+      lookups[t.key] = new Map();
+    }
+  }
+  playlistLookupCache = { at: Date.now(), lookups, failures };
+  return playlistLookupCache;
 }
 
-async function renderSpotifyGaps() {
-  const data = await api(`/api/report/spotify-gaps${companionsQuery()}`);
-  dashBody().innerHTML = `
-    <div class="card">
-      <h2>Spotify Gaps</h2>
-      <p class="muted" style="margin-bottom:14px;">Songs you've seen live that never made it into a Spotify playlist — either from before the app (marked as not-on-Spotify in the historical import) or synced shows where no valid Spotify match was ever found (covers excluded).</p>
-      <table>
-        <tr><th>Artist</th><th>Song</th></tr>
-        ${data.songs.map(s => `<tr><td>${s.artist}</td><td>${s.title}</td></tr>`).join('') || '<tr><td class="muted">None — everything made it in.</td></tr>'}
-      </table>
-    </div>
-  `;
-}
+// The right first step for the historical backlog: instead of searching
+// Spotify's whole catalog per song (slow, quota-hungry, and picks a version
+// you didn't choose), fetch Seen In Concert once and match locally against
+// what you've already curated there. A match here needs no approval — it's
+// not a new decision, just recognizing a song that's already exactly where
+// you put it. Deliberately scoped to Seen In Concert only — this is about
+// tying every song to a real track ID, not about which companion playlists
+// a song needs to land in (that's what gaps check handles). Batched the
+// same way as gap-check (excludeIds, not offset) so a large backlog shows
+// real progress instead of one long silent request.
+app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
+  const limit = 200; // cheap per-item (local lookup + one DB write), so a bigger batch than gap-check's is fine
+  const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
 
-boot();
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  if (!cfg.seen_playlist_id) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured in Settings.' });
+  const targetDefs = [{ key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) }];
+
+  let lookups, playlistFailures;
+  try {
+    const cache = await getCachedPlaylistLookups(targetDefs);
+    lookups = cache.lookups;
+    playlistFailures = cache.failures;
+  } catch (e) {
+    // Safety net only — getCachedPlaylistLookups now catches per-playlist
+    // failures internally, so this should only fire on something truly
+    // unexpected (e.g. the config query itself failing).
+    const isQuota = e.isQuotaExceeded || /QUOTA_EXCEEDED/i.test(e.message || '');
+    const isForbidden = /"status"\s*:\s*403/.test(e.message || '');
+    const guidance = isQuota
+      ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
+      : isForbidden
+      ? "This usually means the connected Spotify account doesn't have permission to read one of these playlists — go to Settings and click Connect Spotify again. Make sure you actually see Spotify's permission screen this time (it should list reading your playlists, not just modifying them) — if it skips straight past without showing you anything to approve, that's the bug, not you."
+      : '';
+    return res.status(502).json({ error: `Couldn't read your playlists from Spotify: ${e.message}. ${guidance}` });
+  }
+
+  const totalRow = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+  `)).rows[0];
+  const total = Number(totalRow.c) + excludeIds.length;
+
+  const batch = (await pool.query(`
+    SELECT DISTINCT s.id, s.artist, s.title
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+      AND ($1::int[] = '{}' OR s.id != ALL($1::int[]))
+    ORDER BY s.id
+    LIMIT $2
+  `, [excludeIds, limit])).rows;
+
+  let matched = 0;
+  for (const song of batch) {
+    const key = `${artistKey(song.artist)}|${normalizeTitle(song.title)}`;
+    let track = null;
+    const foundInTargets = [];
+    for (const t of targetDefs) {
+      const hit = lookups[t.key].get(key);
+      if (hit) { track = track || hit; foundInTargets.push(t.key); }
+    }
+    if (!track) continue;
+
+    await pool.query(
+      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+      [track.id, track.name, track.albumName, track.albumArtUrl, song.id]
+    );
+    for (const key2 of foundInTargets) {
+      await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${key2}=true WHERE song_id=$1`, [song.id]);
+    }
+    matched++;
+  }
+
+  const attemptedIds = batch.map(s => s.id);
+  const processed = excludeIds.length + attemptedIds.length;
+  res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit, playlistFailures });
+});
+
+// Diagnostic: shows exactly how many tracks got read from each configured
+// playlist right now — if one comes back suspiciously low or zero despite
+// being a real, populated playlist, that's the actual cause of everything
+// in it looking "missing."
+app.get('/api/spotify/playlist-sizes', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ].filter(t => t.playlistId);
+  const results = [];
+  for (const t of targetDefs) {
+    try {
+      const ids = await spotify.getPlaylistTrackIds(t.playlistId);
+      results.push({ label: t.label, size: ids.size, error: null });
+    } catch (e) {
+      results.push({ label: t.label, size: null, error: e.message });
+    }
+  }
+  res.json({ results });
+});
+
+app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
+  // Scoped to songs with at least one 'seen' occurrence — a song that's
+  // only ever been missed or skipped never needs a Spotify match at all,
+  // and counting it here (as the raw songs-table query used to) inflated
+  // "pending" with songs that don't actually need any action.
+  const byStatus = (await pool.query(`
+    SELECT s.spotify_status, count(DISTINCT s.id) AS c
+    FROM songs s JOIN show_songs ss ON ss.song_id = s.id
+    WHERE ss.status = 'seen'
+    GROUP BY s.spotify_status
+  `)).rows;
+  const totalSeen = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id WHERE ss.status = 'seen'
+  `)).rows[0];
+  const missedOrSkippedOnly = (await pool.query(`
+    SELECT count(*) AS c FROM songs s
+    WHERE NOT EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id AND ss.status = 'seen')
+      AND EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id)
+  `)).rows[0];
+  const withRealTrack = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NOT NULL
+  `)).rows[0];
+  const recentlyMatched = (await pool.query(
+    `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
+  )).rows;
+  const excludedSongs = (await pool.query(
+    `SELECT id, title, artist FROM songs WHERE spotify_status='excluded' ORDER BY id DESC LIMIT 20`
+  )).rows;
+  res.json({
+    totalSongs: Number(totalSeen.c),
+    missedOrSkippedOnlyCount: Number(missedOrSkippedOnly.c),
+    withRealTrackId: Number(withRealTrack.c),
+    byStatus: Object.fromEntries(byStatus.map(r => [r.spotify_status, Number(r.c)])),
+    recentlyMatched,
+    excludedSongs,
+  });
+});
+
+app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
+  const limit = 40; // keeps each call well under a minute even including Spotify round-trips
+  // Song IDs already attempted this run (resolved or not) — passed back by
+  // the client each call. This is what actually fixes the skipping bug:
+  // OFFSET against a WHERE clause that shrinks as songs get resolved was
+  // silently skipping unresolved songs between batches. Excluding by ID
+  // instead means nothing gets skipped, whether it resolved or not.
+  const excludeIds = (req.query.excludeIds ? req.query.excludeIds.split(',') : []).map(Number).filter(Number.isFinite);
+
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ];
+  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
+
+  const totalRow = (await pool.query(`
+    SELECT count(DISTINCT s.id) AS c
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+  `)).rows[0];
+  const total = Number(totalRow.c) + excludeIds.length; // stable total for progress display
+
+  const gapSongs = (await pool.query(`
+    SELECT DISTINCT s.id, s.artist, s.title
+    FROM show_songs ss
+    JOIN show_artists sa ON sa.id = ss.show_artist_id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+      AND ($1::int[] = '{}' OR s.id != ALL($1::int[]))
+    ORDER BY s.id
+    LIMIT $2
+  `, [excludeIds, limit])).rows;
+
+  let autoMarked = 0;
+  const needsAddition = [];
+  const attemptedIds = [];
+  let searchErrors = 0;
+  let firstSearchError = null;
+  let noCandidates = 0;
+  let stoppedEarly = false;
+
+  for (const song of gapSongs) {
+    // If Spotify search is failing systemically (bad/expired token, etc.),
+    // stop burning through the batch and surface it immediately — silently
+    // continuing past every failure was exactly what made this look like
+    // "nothing missing" instead of "everything is failing." Songs not yet
+    // attempted stay eligible for next run rather than being marked done.
+    if (searchErrors >= 5) { stoppedEarly = true; break; }
+
+    // Which playlists does this song actually belong in, across every show it appears at?
+    const companionRows = (await pool.query(`
+      SELECT DISTINCT c.name FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN show_companions sc ON sc.show_id = sa.show_id
+      JOIN companions c ON c.id = sc.companion_id
+      WHERE ss.song_id = $1
+    `, [song.id])).rows.map(r => r.name);
+    const applicableTargets = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
+
+    let candidates = [];
+    try { candidates = await spotify.searchTrack(song.title, song.artist); }
+    catch (e) { searchErrors++; firstSearchError = firstSearchError || e.message; continue; }
+    attemptedIds.push(song.id);
+    await ors.sleep(120);
+    const best = candidates[0];
+    if (!best) { noCandidates++; continue; }
+
+    const missingFrom = applicableTargets.filter(t => !playlistIdSets[t.key].has(best.id));
+    const alreadyIn = applicableTargets.filter(t => playlistIdSets[t.key].has(best.id));
+
+    // The match itself gets saved the instant it's found, no matter what —
+    // this is what actually fixes losing 280 real matches to a quota
+    // interruption. Only the PLAYLIST PUSH (a deliberate Spotify write)
+    // waits for approval; the song-to-track tie is never at risk again.
+    await pool.query(
+      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+      [best.id, best.name, best.albumName, best.albumArtUrl, song.id]
+    );
+
+    if (alreadyIn.length) {
+      // The playlist already has it — the dataset was just out of date.
+      for (const t of alreadyIn) {
+        await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${t.key}=true WHERE song_id=$1`, [song.id]);
+      }
+      autoMarked++;
+    }
+    if (missingFrom.length) {
+      needsAddition.push({
+        songId: song.id, artist: song.artist, title: song.title, track: best,
+        targets: missingFrom.map(t => t.key),
+      });
+    }
+  }
+
+  const processedSoFar = excludeIds.length + attemptedIds.length;
+  res.json({
+    autoMarked, needsAddition, total, attemptedIds, processed: processedSoFar,
+    done: !stoppedEarly && gapSongs.length < limit,
+    noCandidates, searchErrors, searchErrorMessage: firstSearchError, stoppedEarly,
+  });
+});
+
+// Durable version of "needs playlist push" — unlike gap-check's own
+// needsAddition list (which only reflects one run and is lost if that run
+// gets interrupted), this is derived fresh from the database every time,
+// so a match found in ANY past run (even one that never got approved) is
+// always findable here.
+app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ];
+  const matched = (await pool.query(`
+    SELECT s.id AS song_id, s.title, s.artist, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
+    FROM songs s WHERE s.spotify_status='matched' AND s.spotify_track_id IS NOT NULL
+  `)).rows;
+
+  const pending = [];
+  for (const song of matched) {
+    const companionRows = (await pool.query(`
+      SELECT DISTINCT c.name FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN show_companions sc ON sc.show_id = sa.show_id
+      JOIN companions c ON c.id = sc.companion_id
+      WHERE ss.song_id = $1
+    `, [song.song_id])).rows.map(r => r.name);
+    const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
+    const flags = (await pool.query(`SELECT bool_and(added_to_seen) AS seen, bool_and(added_to_wes) AS wes, bool_and(added_to_dad) AS dad FROM show_songs WHERE song_id=$1`, [song.song_id])).rows[0];
+    const missing = applicable.filter(t => !flags[t.key]);
+    if (missing.length) {
+      pending.push({
+        songId: song.song_id, artist: song.artist, title: song.title,
+        track: { id: song.spotify_track_id, name: song.spotify_track_name, albumName: song.spotify_album_name, albumArtUrl: song.spotify_album_art_url },
+        targets: missing.map(t => t.key),
+      });
+    }
+  }
+  res.json({ pending });
+});
+
+app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
+  const { additions } = req.body; // [{songId, track, targets: ['seen','wes','dad']}]
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const playlistIds = { seen: extractPlaylistId(cfg.seen_playlist_id), wes: extractPlaylistId(cfg.wes_playlist_id), dad: extractPlaylistId(cfg.dad_playlist_id) };
+
+  const byTarget = { seen: [], wes: [], dad: [] };
+  for (const a of additions || []) {
+    await pool.query(
+      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+      [a.track.id, a.track.name, a.track.albumName, a.track.albumArtUrl, a.songId]
+    );
+    for (const key of a.targets) byTarget[key].push(a);
+  }
+  let added = 0;
+  for (const key of ['seen', 'wes', 'dad']) {
+    const items = byTarget[key];
+    if (!items.length) continue;
+    await spotify.addTracksToPlaylist(playlistIds[key], items.map(a => `spotify:track:${a.track.id}`));
+    for (const a of items) {
+      await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${key}=true WHERE song_id=$1`, [a.songId]);
+    }
+    added += items.length;
+  }
+  res.json({ ok: true, added });
+});
+
+// One-off maintenance: retries geocoding/driving-distance for any show
+// still missing miles/minutes. Falls back to the default home address when
+// a show has no origin_address of its own set yet, and reports exactly why
+// any show is still failing instead of a silent count.
+app.post('/api/admin/backfill-travel', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT default_origin_address FROM config WHERE id=1')).rows[0];
+  const missing = (await pool.query(
+    `SELECT id, origin_address, venue, city, state, venue_lat, venue_lng FROM shows WHERE distance_miles IS NULL OR duration_minutes IS NULL`
+  )).rows;
+  let fixed = 0;
+  const failures = [];
+  for (const sh of missing) {
+    const originAddress = sh.origin_address || cfg.default_origin_address;
+    if (!originAddress) {
+      failures.push({ id: sh.id, venue: sh.venue, reason: 'No origin address on this show, and no default home address set in Settings.' });
+      continue;
+    }
+    try {
+      let venueCoord = (sh.venue_lat && sh.venue_lng) ? { lat: sh.venue_lat, lng: sh.venue_lng } : null;
+      if (!venueCoord) {
+        venueCoord = await ors.geocodeVenue(sh.venue, sh.city, sh.state);
+        if (venueCoord) await pool.query('UPDATE shows SET venue_lat=$1, venue_lng=$2 WHERE id=$3', [venueCoord.lat, venueCoord.lng, sh.id]);
+      }
+      if (!venueCoord) {
+        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find "${sh.venue}" or even the city "${sh.city}, ${sh.state || ''}".` });
+        continue;
+      }
+      const originCoord = await ors.geocode(originAddress);
+      if (!originCoord) {
+        failures.push({ id: sh.id, venue: sh.venue, reason: `The maps service couldn't find the starting address "${originAddress}".` });
+        continue;
+      }
+      const distance = await ors.drivingDistance(originCoord, venueCoord);
+      await pool.query(
+        'UPDATE shows SET origin_address=$1, origin_lat=$2, origin_lng=$3, distance_miles=$4, duration_minutes=$5 WHERE id=$6',
+        [originAddress, originCoord.lat, originCoord.lng, distance.miles, distance.minutes, sh.id]
+      );
+      fixed++;
+    } catch (e) {
+      failures.push({ id: sh.id, venue: sh.venue, reason: e.message });
+    }
+  }
+  res.json({ ok: true, fixed, checked: missing.length, stillMissing: failures.length, failures });
+});
+
+const PORT = process.env.PORT || 3000;
+initSchema()
+  .then(() => app.listen(PORT, () => console.log(`Concert tracker running on port ${PORT}`)))
+  .catch(err => { console.error('Failed to init schema', err); process.exit(1); });
