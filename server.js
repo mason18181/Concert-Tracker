@@ -156,6 +156,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
     const geoFailures = [];
     const venueCoordCache = {};
     let artistsAdded = 0;
+    let artistsReplaced = 0;
 
     async function insertArtistBlock(showId, artistBlock) {
       const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
@@ -176,6 +177,31 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
     }
 
+    // Same as insertArtistBlock, but for an artist that already has a row
+    // (typically from a live setlist.fm sync) — replaces its songs with
+    // the spreadsheet's version instead of creating a duplicate, and marks
+    // the source as spreadsheet import so this is idempotent: re-running
+    // import won't redo this once it's already been corrected.
+    async function replaceArtistFromSpreadsheet(showArtistId, artistBlock) {
+      await pool.query('DELETE FROM show_songs WHERE show_artist_id=$1', [showArtistId]);
+      const originalTitles = [...artistBlock.songs].sort((a, b) => a.play_order - b.play_order).map(s => s.song);
+      await pool.query(
+        `UPDATE show_artists SET billing_order=$1, original_setlist=$2, setlist_source='spreadsheet import' WHERE id=$3`,
+        [artistBlock.billing_order, JSON.stringify(originalTitles), showArtistId]
+      );
+      for (const s of artistBlock.songs) {
+        const song = await findOrCreateSong(artistBlock.artist, s.song);
+        if (s.already_on_spotify && song.spotify_status === 'pending') {
+          await pool.query(`UPDATE songs SET spotify_status='assumed_added' WHERE id=$1`, [song.id]);
+        }
+        await pool.query(
+          `INSERT INTO show_songs (show_artist_id, song_id, play_order, known, liked_now, status, already_on_spotify, added_to_seen)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [showArtistId, song.id, s.play_order, s.known, s.liked_now, s.status, s.already_on_spotify, s.already_on_spotify]
+        );
+      }
+    }
+
     for (const show of shows) {
       const already = (await pool.query('SELECT id, distance_miles, duration_minutes FROM shows WHERE date=$1 AND venue=$2', [show.date, show.venue])).rows[0];
       if (already) {
@@ -183,9 +209,14 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
 
         // Reconcile artists on an already-imported show: add any artist in
         // the seed that isn't in the database yet (e.g. a headliner you
-        // skipped and didn't originally log), and fix billing order for
-        // existing artists if the seed's order shifted to make room.
-        const existingArtists = (await pool.query('SELECT id, artist, billing_order FROM show_artists WHERE show_id=$1', [already.id])).rows;
+        // skipped and didn't originally log), fix billing order, and — the
+        // important case — if an artist here came from a live setlist.fm
+        // sync rather than a prior spreadsheet import, your spreadsheet is
+        // authoritative and should replace it. Otherwise a live sync that
+        // happened to run first permanently locks in setlist.fm's raw data
+        // (including things like walk-off/outro songs you deliberately
+        // left out) with no way for your curated version to ever apply.
+        const existingArtists = (await pool.query('SELECT id, artist, billing_order, setlist_source FROM show_artists WHERE show_id=$1', [already.id])).rows;
         const existingByName = {};
         existingArtists.forEach(a => { existingByName[a.artist] = a; });
         for (const artistBlock of show.artists) {
@@ -193,6 +224,9 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
           if (!existing) {
             await insertArtistBlock(already.id, artistBlock);
             artistsAdded++;
+          } else if (existing.setlist_source !== 'spreadsheet import') {
+            await replaceArtistFromSpreadsheet(existing.id, artistBlock);
+            artistsReplaced++;
           } else if (existing.billing_order !== artistBlock.billing_order) {
             await pool.query('UPDATE show_artists SET billing_order=$1 WHERE id=$2', [artistBlock.billing_order, existing.id]);
           }
@@ -262,7 +296,7 @@ app.post('/api/import/historical', requireAuth, async (req, res) => {
       }
       imported++;
     }
-    res.json({ ok: true, imported, skipped, geoFilled, geoFailures, artistsAdded });
+    res.json({ ok: true, imported, skipped, geoFilled, geoFailures, artistsAdded, artistsReplaced });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -520,6 +554,26 @@ app.post('/api/show-artists/:id/add-song', requireAuth, async (req, res) => {
 app.post('/api/show-songs/:id/remove', requireAuth, async (req, res) => {
   await pool.query('DELETE FROM show_songs WHERE id=$1', [Number(req.params.id)]);
   res.json({ ok: true });
+});
+
+// For a song that shouldn't be in the dataset at all (not something that
+// belongs to one show, but genuinely never a real performed song — like
+// walk-off/outro music setlist.fm sometimes lists as part of a setlist).
+// Songs are shared across every show they appear at, so this finds and
+// removes every occurrence in one action instead of a show-by-show hunt.
+app.get('/api/songs/:id/occurrences', requireAuth, async (req, res) => {
+  const rows = (await pool.query(`
+    SELECT ss.id AS show_song_id, sh.date, sh.venue, sa.artist
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
+    WHERE ss.song_id = $1 ORDER BY sh.date
+  `, [Number(req.params.id)])).rows;
+  res.json({ occurrences: rows });
+});
+
+app.post('/api/songs/:id/remove-everywhere', requireAuth, async (req, res) => {
+  const songId = Number(req.params.id);
+  const result = await pool.query('DELETE FROM show_songs WHERE song_id=$1', [songId]);
+  res.json({ ok: true, removed: result.rowCount });
 });
 
 app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
@@ -1467,6 +1521,29 @@ app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
   res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit, playlistFailures });
 });
 
+// Diagnostic: shows exactly how many tracks got read from each configured
+// playlist right now — if one comes back suspiciously low or zero despite
+// being a real, populated playlist, that's the actual cause of everything
+// in it looking "missing."
+app.get('/api/spotify/playlist-sizes', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ].filter(t => t.playlistId);
+  const results = [];
+  for (const t of targetDefs) {
+    try {
+      const ids = await spotify.getPlaylistTrackIds(t.playlistId);
+      results.push({ label: t.label, size: ids.size, error: null });
+    } catch (e) {
+      results.push({ label: t.label, size: null, error: e.message });
+    }
+  }
+  res.json({ results });
+});
+
 app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
   // Scoped to songs with at least one 'seen' occurrence — a song that's
   // only ever been missed or skipped never needs a Spotify match at all,
@@ -1494,7 +1571,7 @@ app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
     `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
   )).rows;
   const excludedSongs = (await pool.query(
-    `SELECT title, artist FROM songs WHERE spotify_status='excluded' ORDER BY id DESC LIMIT 20`
+    `SELECT id, title, artist FROM songs WHERE spotify_status='excluded' ORDER BY id DESC LIMIT 20`
   )).rows;
   res.json({
     totalSongs: Number(totalSeen.c),
