@@ -394,12 +394,45 @@ app.delete('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
 
 app.get('/api/shows/all', requireAuth, async (req, res) => {
   const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
+
+  // One query for both counts across every show — scoped per-show (not
+  // globally per-song like gap-check), since "did Wes attend this
+  // particular show" is what actually determines whether a song needs to
+  // be in Wes's playlist because of it.
+  const counts = (await pool.query(`
+    WITH show_companion_names AS (
+      SELECT sc.show_id, array_agg(c.name) AS names
+      FROM show_companions sc JOIN companions c ON c.id = sc.companion_id
+      GROUP BY sc.show_id
+    )
+    SELECT sh.id AS show_id,
+      count(*) FILTER (WHERE ss.status='seen' AND s.spotify_track_id IS NULL) AS unmatched,
+      count(*) FILTER (
+        WHERE ss.status='seen' AND s.spotify_track_id IS NOT NULL AND (
+          NOT ss.added_to_seen
+          OR (NOT ss.added_to_wes AND 'Wes' = ANY(COALESCE(scn.names, '{}')))
+          OR (NOT ss.added_to_dad AND 'Jeff' = ANY(COALESCE(scn.names, '{}')))
+        )
+      ) AS not_added
+    FROM shows sh
+    JOIN show_artists sa ON sa.show_id = sh.id
+    JOIN show_songs ss ON ss.show_artist_id = sa.id
+    JOIN songs s ON s.id = ss.song_id
+    LEFT JOIN show_companion_names scn ON scn.show_id = sh.id
+    GROUP BY sh.id
+  `)).rows;
+  const countsByShowId = {};
+  counts.forEach(c => { countsByShowId[c.show_id] = { unmatched: Number(c.unmatched), notAdded: Number(c.not_added) }; });
+
   for (const sh of shows) {
     sh.artists = (await pool.query(
       `SELECT id, artist, billing_order, setlistfm_url, setlistfm_id, marked_attended FROM show_artists WHERE show_id=$1 ORDER BY billing_order NULLS LAST, id`,
       [sh.id]
     )).rows;
     sh.headliner = sh.artists[0] ? sh.artists[0].artist : null;
+    const c = countsByShowId[sh.id] || { unmatched: 0, notAdded: 0 };
+    sh.unmatchedCount = c.unmatched;
+    sh.notAddedCount = c.notAdded;
   }
   res.json(shows);
 });
@@ -1522,21 +1555,18 @@ app.get('/api/spotify/fuzzy-match-seen', requireAuth, async (req, res) => {
   const results = [];
   for (const song of unresolved) {
     const candidateTracks = byArtist[artistKey(song.artist)] || [];
-    if (!candidateTracks.length) continue;
     const normTitle = normalizeTitle(song.title);
     const scored = candidateTracks
       .map(t => ({ track: t, score: titleSimilarity(normTitle, normalizeTitle(t.name)) }))
       .filter(s => s.score >= 0.5)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
-    if (scored.length) {
-      results.push({
-        songId: song.id, title: song.title, artist: song.artist,
-        candidates: scored.map(s => ({ id: s.track.id, name: s.track.name, albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100) })),
-      });
-    }
+    results.push({
+      songId: song.id, title: song.title, artist: song.artist,
+      candidates: scored.map(s => ({ id: s.track.id, name: s.track.name, artist: song.artist, albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100) })),
+    });
   }
-  res.json({ results, totalUnresolved: unresolved.length, withCandidates: results.length });
+  res.json({ results, totalUnresolved: unresolved.length, withCandidates: results.filter(r => r.candidates.length).length });
 });
 
 app.post('/api/spotify/fuzzy-match-seen/apply', requireAuth, async (req, res) => {
@@ -1668,7 +1698,9 @@ app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
     `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
   )).rows;
   const excludedSongs = (await pool.query(
-    `SELECT id, title, artist FROM songs WHERE spotify_status='excluded' ORDER BY id DESC LIMIT 20`
+    `SELECT id, title, artist FROM songs s WHERE spotify_status='excluded'
+     AND EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id)
+     ORDER BY id DESC LIMIT 20`
   )).rows;
   res.json({
     totalSongs: Number(totalSeen.c),
