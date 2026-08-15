@@ -395,34 +395,43 @@ app.delete('/api/shows/:id(\\d+)', requireAuth, async (req, res) => {
 app.get('/api/shows/all', requireAuth, async (req, res) => {
   const shows = (await pool.query(`SELECT id, date, venue, city, state, stage FROM shows ORDER BY date DESC`)).rows;
 
-  // One query for both counts across every show — scoped per-show (not
-  // globally per-song like gap-check), since "did Wes attend this
-  // particular show" is what actually determines whether a song needs to
-  // be in Wes's playlist because of it.
-  const counts = (await pool.query(`
-    WITH show_companion_names AS (
-      SELECT sc.show_id, array_agg(c.name) AS names
-      FROM show_companions sc JOIN companions c ON c.id = sc.companion_id
-      GROUP BY sc.show_id
-    )
-    SELECT sh.id AS show_id,
-      count(*) FILTER (WHERE ss.status='seen' AND s.spotify_track_id IS NULL) AS unmatched,
-      count(*) FILTER (
-        WHERE ss.status='seen' AND s.spotify_track_id IS NOT NULL AND (
-          NOT ss.added_to_seen
-          OR (NOT ss.added_to_wes AND 'Wes' = ANY(COALESCE(scn.names, '{}')))
-          OR (NOT ss.added_to_dad AND 'Jeff' = ANY(COALESCE(scn.names, '{}')))
-        )
-      ) AS not_added
+  // "Not added" has to be checked against the real, current contents of
+  // each Spotify playlist — not our own added_to_seen/wes/dad flags, which
+  // go stale the moment a song gets matched through a path that doesn't
+  // set them (e.g. "Match from my playlists" only ever sets added_to_seen,
+  // since it's intentionally scoped to that one playlist — it never
+  // touches the Wes/Dad flags even for a song that's genuinely already in
+  // those real playlists). Reuses the same cached real-playlist-contents
+  // check gap-check already relies on correctly.
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ].filter(t => t.playlistId);
+  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
+
+  const rows = (await pool.query(`
+    SELECT sh.id AS show_id, ss.id AS show_song_id, s.spotify_track_id,
+      array_remove(array_agg(DISTINCT c.name), NULL) AS companions
     FROM shows sh
     JOIN show_artists sa ON sa.show_id = sh.id
     JOIN show_songs ss ON ss.show_artist_id = sa.id
     JOIN songs s ON s.id = ss.song_id
-    LEFT JOIN show_companion_names scn ON scn.show_id = sh.id
-    GROUP BY sh.id
+    LEFT JOIN show_companions sc ON sc.show_id = sh.id
+    LEFT JOIN companions c ON c.id = sc.companion_id
+    WHERE ss.status = 'seen'
+    GROUP BY sh.id, ss.id, s.spotify_track_id
   `)).rows;
+
   const countsByShowId = {};
-  counts.forEach(c => { countsByShowId[c.show_id] = { unmatched: Number(c.unmatched), notAdded: Number(c.not_added) }; });
+  for (const r of rows) {
+    const bucket = (countsByShowId[r.show_id] = countsByShowId[r.show_id] || { unmatched: 0, notAdded: 0 });
+    if (!r.spotify_track_id) { bucket.unmatched++; continue; }
+    const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && r.companions.includes('Wes')) || (t.key === 'dad' && r.companions.includes('Jeff')));
+    const missing = applicable.some(t => !playlistIdSets[t.key].has(r.spotify_track_id));
+    if (missing) bucket.notAdded++;
+  }
 
   for (const sh of shows) {
     sh.artists = (await pool.query(
@@ -1531,12 +1540,47 @@ function titleSimilarity(a, b) {
 // this is purely "what in Seen In Concert probably represents this song,"
 // surfaced for you to confirm, not auto-applied since fuzzy matches are
 // inherently less certain than exact ones.
+let seenTracksCache = { at: 0, tracks: null };
+async function getCachedSeenTracks(playlistId) {
+  if (seenTracksCache.tracks && Date.now() - seenTracksCache.at < 10 * 60 * 1000) return seenTracksCache.tracks;
+  const tracks = await spotify.getPlaylistTracksFull(playlistId);
+  seenTracksCache = { at: Date.now(), tracks };
+  return tracks;
+}
+
+// For the fuzzy-match tool's "search manually" fallback — deliberately
+// searches only within Seen In Concert's own tracks, never Spotify's wider
+// catalog, since the whole point here is "what in the playlist represents
+// this song," not finding a new candidate that isn't in the playlist yet.
+app.post('/api/spotify/search-within-seen', requireAuth, async (req, res) => {
+  const { query, artist } = req.body;
+  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
+  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
+  if (!playlistId) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured.' });
+
+  const tracks = await getCachedSeenTracks(playlistId);
+  const normQuery = normalizeTitle(query || '');
+  const artistFilter = artist ? artistKey(artist) : null;
+
+  const scored = tracks
+    .filter(t => !artistFilter || t.artists.some(a => artistKey(a).includes(artistFilter) || artistFilter.includes(artistKey(a))))
+    .map(t => ({ track: t, score: titleSimilarity(normQuery, normalizeTitle(t.name)) }))
+    .filter(s => s.score >= 0.3 || normalizeTitle(s.track.name).includes(normQuery) || normQuery.includes(normalizeTitle(s.track.name)))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+
+  res.json(scored.map(s => ({
+    id: s.track.id, name: s.track.name, artist: s.track.artists.join(', '),
+    albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100),
+  })));
+});
+
 app.get('/api/spotify/fuzzy-match-seen', requireAuth, async (req, res) => {
   const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
   const playlistId = extractPlaylistId(cfg.seen_playlist_id);
   if (!playlistId) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured.' });
 
-  const tracks = await spotify.getPlaylistTracksFull(playlistId);
+  const tracks = await getCachedSeenTracks(playlistId);
   const byArtist = {};
   for (const t of tracks) {
     for (const a of t.artists) {
@@ -1827,7 +1871,9 @@ app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
     { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
     { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
     { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
-  ];
+  ].filter(t => t.playlistId);
+  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
+
   const matched = (await pool.query(`
     SELECT s.id AS song_id, s.title, s.artist, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
     FROM songs s WHERE s.spotify_status='matched' AND s.spotify_track_id IS NOT NULL
@@ -1843,8 +1889,19 @@ app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
       WHERE ss.song_id = $1
     `, [song.song_id])).rows.map(r => r.name);
     const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
-    const flags = (await pool.query(`SELECT bool_and(added_to_seen) AS seen, bool_and(added_to_wes) AS wes, bool_and(added_to_dad) AS dad FROM show_songs WHERE song_id=$1`, [song.song_id])).rows[0];
-    const missing = applicable.filter(t => !flags[t.key]);
+    // Checked against the real playlist contents, not our own added_to_X
+    // flags — those go stale the moment a song is matched through a path
+    // (like "Match from my playlists") that doesn't touch every flag, and
+    // trusting them blindly risked suggesting a duplicate push for a song
+    // that's already genuinely in the playlist.
+    const alreadyThere = applicable.filter(t => playlistIdSets[t.key] && playlistIdSets[t.key].has(song.spotify_track_id));
+    const missing = applicable.filter(t => !playlistIdSets[t.key] || !playlistIdSets[t.key].has(song.spotify_track_id));
+    // Record what we just confirmed — this is what makes the flags
+    // actually trustworthy going forward instead of permanently stale:
+    // once a song's real presence is verified, it never needs re-checking.
+    for (const t of alreadyThere) {
+      await pool.query(`UPDATE show_songs SET added_to_${t.key}=true WHERE song_id=$1`, [song.song_id]);
+    }
     if (missing.length) {
       pending.push({
         songId: song.song_id, artist: song.artist, title: song.title,
@@ -1869,17 +1926,25 @@ app.post('/api/spotify/gap-check/apply', requireAuth, async (req, res) => {
     );
     for (const key of a.targets) byTarget[key].push(a);
   }
-  let added = 0;
+  let added = 0, skippedAlreadyPresent = 0;
   for (const key of ['seen', 'wes', 'dad']) {
     const items = byTarget[key];
     if (!items.length) continue;
-    await spotify.addTracksToPlaylist(playlistIds[key], items.map(a => `spotify:track:${a.track.id}`));
+    // One last real check right before the actual write — the approval
+    // list could be a few minutes old by the time you click Add, and this
+    // is what stops an already-present song from ever actually reaching
+    // Spotify as a duplicate, no matter how it got onto the list.
+    let currentIds;
+    try { currentIds = await spotify.getPlaylistTrackIds(playlistIds[key]); } catch (e) { currentIds = new Set(); }
+    const toPush = items.filter(a => !currentIds.has(a.track.id));
+    skippedAlreadyPresent += items.length - toPush.length;
+    if (toPush.length) await spotify.addTracksToPlaylist(playlistIds[key], toPush.map(a => `spotify:track:${a.track.id}`));
     for (const a of items) {
       await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${key}=true WHERE song_id=$1`, [a.songId]);
     }
-    added += items.length;
+    added += toPush.length;
   }
-  res.json({ ok: true, added });
+  res.json({ ok: true, added, skippedAlreadyPresent });
 });
 
 // One-off maintenance: retries geocoding/driving-distance for any show
