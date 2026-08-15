@@ -570,6 +570,28 @@ app.get('/api/songs/:id/occurrences', requireAuth, async (req, res) => {
   res.json({ occurrences: rows });
 });
 
+// Diagnostic: finds every songs-table row matching a title (there could be
+// more than one if duplicates exist), each with its full status and every
+// show it's attached to — including that show's setlist_source, since a
+// song reappearing after being removed could mean either the removal
+// didn't persist, or something else independently recreated it.
+app.get('/api/songs/lookup', requireAuth, async (req, res) => {
+  const title = req.query.title || '';
+  if (!title) return res.json({ songs: [] });
+  const songs = (await pool.query(
+    `SELECT id, title, artist, spotify_status FROM songs WHERE title ILIKE $1 ORDER BY id`,
+    [`%${title}%`]
+  )).rows;
+  for (const song of songs) {
+    song.occurrences = (await pool.query(`
+      SELECT sh.date, sh.venue, sa.artist, sa.setlist_source
+      FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
+      WHERE ss.song_id = $1 ORDER BY sh.date
+    `, [song.id])).rows;
+  }
+  res.json({ songs });
+});
+
 app.post('/api/songs/:id/remove-everywhere', requireAuth, async (req, res) => {
   const songId = Number(req.params.id);
   const result = await pool.query('DELETE FROM show_songs WHERE song_id=$1', [songId]);
@@ -1452,6 +1474,81 @@ async function getCachedPlaylistLookups(targetDefs) {
 // a song needs to land in (that's what gaps check handles). Batched the
 // same way as gap-check (excludeIds, not offset) so a large backlog shows
 // real progress instead of one long silent request.
+function levenshtein(a, b) {
+  const dp = [];
+  for (let i = 0; i <= a.length; i++) dp.push([i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+function titleSimilarity(a, b) {
+  const dist = levenshtein(a, b);
+  const maxLen = Math.max(a.length, b.length) || 1;
+  return 1 - dist / maxLen;
+}
+
+// For the songs "Match from my playlists" couldn't resolve with an exact
+// title match — this looks for a close (not exact) match within Seen In
+// Concert specifically, and only Seen In Concert. It never searches
+// Spotify's wider catalog and never compares against Wes/Dad's playlists —
+// this is purely "what in Seen In Concert probably represents this song,"
+// surfaced for you to confirm, not auto-applied since fuzzy matches are
+// inherently less certain than exact ones.
+app.get('/api/spotify/fuzzy-match-seen', requireAuth, async (req, res) => {
+  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
+  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
+  if (!playlistId) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured.' });
+
+  const tracks = await spotify.getPlaylistTracksFull(playlistId);
+  const byArtist = {};
+  for (const t of tracks) {
+    for (const a of t.artists) {
+      const key = artistKey(a);
+      (byArtist[key] = byArtist[key] || []).push(t);
+    }
+  }
+
+  const unresolved = (await pool.query(`
+    SELECT DISTINCT s.id, s.artist, s.title
+    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
+    ORDER BY s.artist, s.title
+  `)).rows;
+
+  const results = [];
+  for (const song of unresolved) {
+    const candidateTracks = byArtist[artistKey(song.artist)] || [];
+    if (!candidateTracks.length) continue;
+    const normTitle = normalizeTitle(song.title);
+    const scored = candidateTracks
+      .map(t => ({ track: t, score: titleSimilarity(normTitle, normalizeTitle(t.name)) }))
+      .filter(s => s.score >= 0.5)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+    if (scored.length) {
+      results.push({
+        songId: song.id, title: song.title, artist: song.artist,
+        candidates: scored.map(s => ({ id: s.track.id, name: s.track.name, albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100) })),
+      });
+    }
+  }
+  res.json({ results, totalUnresolved: unresolved.length, withCandidates: results.length });
+});
+
+app.post('/api/spotify/fuzzy-match-seen/apply', requireAuth, async (req, res) => {
+  const { songId, track } = req.body;
+  await pool.query(
+    `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+    [track.id, track.name, track.albumName, track.albumArtUrl, songId]
+  );
+  await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_seen=true WHERE song_id=$1`, [songId]);
+  res.json({ ok: true });
+});
+
 app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
   const limit = 200; // cheap per-item (local lookup + one DB write), so a bigger batch than gap-check's is fine
   const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
