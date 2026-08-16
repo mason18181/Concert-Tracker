@@ -61,6 +61,37 @@ function extractPlaylistId(input) {
   return trimmed.split('?')[0]; // bare ID, possibly with a stray query string
 }
 
+// Finds every songs-table row matching a title, with full status and
+// every show it's attached to — used to see a song's actual stored state
+// directly instead of guessing.
+app.get('/api/songs/lookup', requireAuth, async (req, res) => {
+  const title = req.query.title || '';
+  if (!title) return res.json({ songs: [] });
+  const songs = (await pool.query(
+    `SELECT id, title, artist, spotify_status, spotify_track_id FROM songs WHERE title ILIKE $1 ORDER BY id`,
+    [`%${title}%`]
+  )).rows;
+  for (const song of songs) {
+    song.occurrences = (await pool.query(`
+      SELECT sh.date, sh.venue, sa.artist, ss.status
+      FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
+      WHERE ss.song_id = $1 ORDER BY sh.date
+    `, [song.id])).rows;
+  }
+  res.json({ songs });
+});
+
+// Runs the actual search Spotify search — both the strict and broad
+// queries independently — so we can see exactly where a specific song's
+// search succeeds or fails, instead of just seeing the final "no match."
+app.post('/api/spotify/search-debug', requireAuth, async (req, res) => {
+  const { title, artist } = req.body;
+  try {
+    const result = await spotify.searchTrackDebug(title, artist);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/settings', requireAuth, async (req, res) => {
   const { setlistfmUsername, seenPlaylistId, wesPlaylistId, dadPlaylistId, defaultOriginAddress } = req.body;
   await pool.query(
@@ -412,7 +443,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
   const { sets: playlistIdSets, failures: playlistReadFailures } = await getCachedPlaylistIdSets(targetDefs);
 
   const rows = (await pool.query(`
-    SELECT sh.id AS show_id, ss.id AS show_song_id, s.spotify_track_id,
+    SELECT sh.id AS show_id, ss.id AS show_song_id, s.title, s.artist, s.spotify_track_id,
       array_remove(array_agg(DISTINCT c.name), NULL) AS companions
     FROM shows sh
     JOIN show_artists sa ON sa.show_id = sh.id
@@ -421,19 +452,22 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
     LEFT JOIN show_companions sc ON sc.show_id = sh.id
     LEFT JOIN companions c ON c.id = sc.companion_id
     WHERE ss.status = 'seen'
-    GROUP BY sh.id, ss.id, s.spotify_track_id
+    GROUP BY sh.id, ss.id, s.title, s.artist, s.spotify_track_id
   `)).rows;
 
   const countsByShowId = {};
   for (const r of rows) {
-    const bucket = (countsByShowId[r.show_id] = countsByShowId[r.show_id] || { unmatched: 0, notAdded: 0 });
+    const bucket = (countsByShowId[r.show_id] = countsByShowId[r.show_id] || { unmatched: 0, notAdded: 0, notAddedDetail: [] });
     if (!r.spotify_track_id) { bucket.unmatched++; continue; }
     const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && r.companions.includes('Wes')) || (t.key === 'dad' && r.companions.includes('Jeff')));
     // A playlist we couldn't read (playlistIdSets[key] === null) is never
     // treated as evidence a song is missing from it — only a confirmed,
     // successful read that genuinely doesn't contain the song counts.
-    const missing = applicable.some(t => playlistIdSets[t.key] && !playlistIdSets[t.key].has(r.spotify_track_id));
-    if (missing) bucket.notAdded++;
+    const missingTargets = applicable.filter(t => playlistIdSets[t.key] && !playlistIdSets[t.key].has(r.spotify_track_id));
+    if (missingTargets.length) {
+      bucket.notAdded++;
+      bucket.notAddedDetail.push({ title: r.title, artist: r.artist, missingFrom: missingTargets.map(t => t.key) });
+    }
   }
 
   for (const sh of shows) {
@@ -445,6 +479,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
     const c = countsByShowId[sh.id] || { unmatched: 0, notAdded: 0 };
     sh.unmatchedCount = c.unmatched;
     sh.notAddedCount = c.notAdded;
+    sh.notAddedDetail = c.notAddedDetail || [];
   }
   res.json({ shows, playlistReadFailures });
 });
@@ -510,7 +545,6 @@ app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
       for (const row of artistLookup) {
         if (row.setlistfm_url && !row.setlistfm_id) {
           try {
-            await setlistfm.sleep(300); // getAttendedShows just ran right before this — give setlist.fm's rate limit room to breathe
             const isoDate = new Date(row.date).toISOString().slice(0, 10);
             const fresh = await setlistfm.searchSetlistsByArtistAndDate(row.artist, isoDate);
             row.freshSearchRaw = fresh.map(c => ({ id: c.id, url: c.url, venue: c.venue ? c.venue.name : null }));
