@@ -116,13 +116,30 @@ async function fetchSpotify(url, options, attempt = 1) {
 
 async function searchTrack(title, artist) {
   const token = await getAccessToken();
-  const q = artist ? `track:"${title}" artist:"${artist}"` : `track:"${title}"`;
-  const res = await fetchSpotify(`${API_BASE}/search?type=track&limit=10&q=${encodeURIComponent(q)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Spotify search failed: ${await res.text()}`);
-  const data = await res.json();
-  const items = (data.tracks && data.tracks.items) || [];
+
+  async function runQuery(q) {
+    const res = await fetchSpotify(`${API_BASE}/search?type=track&limit=10&q=${encodeURIComponent(q)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Spotify search failed: ${await res.text()}`);
+    const data = await res.json();
+    return (data.tracks && data.tracks.items) || [];
+  }
+
+  // The strict, field-scoped query (track:"..." artist:"...") is precise
+  // but brittle — it requires a very close string match, and a newly
+  // released song can easily fail it over something as small as a
+  // features credit or slightly different title punctuation on Spotify's
+  // side, even though the song is genuinely there. Falling back to a
+  // broader, unquoted query lets Spotify's own relevance ranking find it
+  // instead of us silently reporting "no match" for something that exists.
+  const strictQuery = artist ? `track:"${title}" artist:"${artist}"` : `track:"${title}"`;
+  let items = await runQuery(strictQuery);
+  if (!items.length) {
+    const broadQuery = artist ? `${title} ${artist}` : title;
+    items = await runQuery(broadQuery);
+  }
+
   const queryNorm = normalizeTitle(title);
   const scored = items
     .map(t => ({ track: t, score: scoreCandidate(t, queryNorm) }))
