@@ -231,8 +231,6 @@ async function renderSettings() {
       <div class="field"><label>Wes Concerts playlist ID</label><input id="pl-wes" value="${s.wesPlaylistId || ''}" /></div>
       <div class="field"><label>Concerts with Dad playlist ID</label><input id="pl-dad" value="${s.dadPlaylistId || ''}" /></div>
       <p class="muted">Paste either the playlist ID or the full share link (open.spotify.com/playlist/...) — either works, it gets cleaned up automatically.</p>
-      <button class="btn secondary" id="diagnose-playlist-btn" style="margin-top:8px;">Diagnose "Seen In Concert" access</button>
-      <div id="diagnose-result" style="margin-top:8px;"></div>
     </div>
     <div class="card">
       <h2>Default travel origin</h2>
@@ -258,25 +256,6 @@ async function renderSettings() {
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
     </div>
   `;
-  document.getElementById('diagnose-playlist-btn').onclick = async () => {
-    const el = document.getElementById('diagnose-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/diagnose-playlist');
-      const lines = [];
-      lines.push(`<div class="muted" style="font-size:12px;">Playlist ID being used: <span style="font-family:monospace;">${d.playlistId}</span></div>`);
-      if (d.tokenError) lines.push(`<p class="error">Couldn't get a Spotify token at all: ${d.tokenError}</p>`);
-      if (d.connectedAsError) lines.push(`<p class="error">Couldn't confirm which account we're connected as: ${d.connectedAsError}</p>`);
-      if (d.connectedAs) lines.push(`<div class="muted" style="font-size:12px;">Connected as: <b>${d.connectedAs.displayName || d.connectedAs.id}</b> (${d.connectedAs.id})</div>`);
-      if (d.playlistError) lines.push(`<p class="error">Couldn't read this playlist's info: ${d.playlistError}</p>`);
-      if (d.playlist) lines.push(`<div class="muted" style="font-size:12px;">Playlist: <b>${d.playlist.name}</b> &middot; owner: ${d.playlist.ownerName} (${d.playlist.ownerId}) &middot; ${d.playlist.public ? 'public' : 'private'}${d.playlist.collaborative ? ', collaborative' : ''}</div>`);
-      if (d.tracksEndpointError) lines.push(`<p class="error" style="margin-top:6px;"><b>The actual failing call, tested directly:</b> ${d.tracksEndpointError}</p>`);
-      if (d.tracksEndpointWorked) lines.push(`<p class="success" style="margin-top:6px;">The tracks endpoint worked directly (got ${d.sampleTrackCount} sample tracks) — if the real button still fails after this, it may be a transient issue, worth trying again.</p>`);
-      if (d.ownershipMismatch) lines.push(`<p class="error" style="margin-top:6px;"><b>Found it:</b> ${d.ownershipMismatch}</p>`);
-      else if (d.connectedAs && d.playlist) lines.push('<p class="success" style="margin-top:6px;">Ownership matches — connected account is the playlist owner.</p>');
-      el.innerHTML = lines.join('');
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
   document.getElementById('sfm-debug-btn').onclick = async () => {
     const el = document.getElementById('sfm-debug-result');
     el.innerHTML = '<p class="muted">Checking...</p>';
@@ -308,6 +287,8 @@ async function renderSettings() {
         <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
           <div>${r.artist} — ${new Date(r.date).toLocaleDateString()}, ${r.venue}</div>
           <div class="muted">checked: ${r.setlistfm_checked} &middot; setlistfm_id: ${r.setlistfm_id || 'none'} &middot; url: ${r.setlistfm_url ? 'yes' : 'none'} &middot; marked_attended (override flag): ${r.marked_attended}</div>
+          ${r.freshSearchError ? `<div class="error">Fresh search failed: ${r.freshSearchError}</div>` : ''}
+          ${r.freshSearchRaw ? `<div class="muted" style="margin-top:4px;">Fresh search right now (raw): ${r.freshSearchRaw.length ? r.freshSearchRaw.map(c => `[id: ${c.id || 'MISSING'}, venue: ${c.venue}]`).join(', ') : 'no results'}</div>` : ''}
         </div>
       `).join('');
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
@@ -429,19 +410,9 @@ async function renderSync() {
       <p class="muted" style="margin-bottom:10px;"><b>Step 1b, for leftovers:</b> for songs step 1 couldn't find an exact match for, this looks for a close (not exact) match — still scoped only to Seen In Concert, not the wider Spotify catalog. Nothing gets applied automatically; you pick the right one per song.</p>
       <button class="btn secondary" id="fuzzy-match-btn">Fuzzy match against Seen In Concert</button>
       <div id="fuzzy-match-result" style="margin-top:10px;margin-bottom:16px;"></div>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify for anything still unresolved (new shows, or whatever step 1 didn't find), and shows everything ready for your review — approve or skip each one, then push the approved ones to your playlists in one go.</p>
+      <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify's catalog for songs with no match at all yet. Click into a song to review candidates (or search manually), and syncing to whichever playlists apply happens as part of that same step.</p>
       <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
-      <div class="divider" style="margin:16px 0;"></div>
-      <button class="btn secondary" id="gapcheck-stats-btn" style="font-size:11px;">Check current match status (diagnostic)</button>
-      <button class="btn secondary" id="playlist-sizes-btn" style="font-size:11px;">Check playlist read sizes (diagnostic)</button>
-      <div id="gapcheck-stats-result" style="margin-top:10px;"></div>
-      <div id="playlist-sizes-result" style="margin-top:10px;"></div>
-      <div class="row" style="margin-top:8px;">
-        <input id="song-lookup-title" placeholder="Look up a song by title (e.g. Happy Trails)" style="max-width:260px;" />
-        <button class="btn secondary" id="song-lookup-btn" style="font-size:11px;">Look up song</button>
-      </div>
-      <div id="song-lookup-result" style="margin-top:10px;"></div>
     </div>
     <div class="card">
       <h2>All shows (edit)</h2>
@@ -578,100 +549,32 @@ async function renderSync() {
     e.target.disabled = true;
     try { await runGapCheck(); } finally { e.target.disabled = false; }
   };
-  document.getElementById('gapcheck-stats-btn').onclick = async () => {
-    const el = document.getElementById('gapcheck-stats-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/match-stats');
-      const statusRows = Object.entries(d.byStatus).map(([status, count]) => `<span class="pill">${status}: ${fmt(count)}</span>`).join(' ');
-      el.innerHTML = `
-        <p class="muted">Of ${fmt(d.totalSongs)} songs you actually saw (missed/skipped-only songs excluded — see below), <b>${fmt(d.withRealTrackId)}</b> are tied to a real Spotify track right now (this is the true, persisted number — not tied to any one run).</p>
-        <p class="muted">By status: ${statusRows}</p>
-        <p class="muted" style="margin-top:6px;">${fmt(d.missedOrSkippedOnlyCount)} other song(s) in your dataset were only ever missed or skipped — these never need a Spotify match, and aren't counted above.</p>
-        ${d.excludedSongs.length ? `<p class="muted" style="margin-top:6px;">Excluded song(s):</p>${d.excludedSongs.map(s => `<div class="row" style="align-items:center;margin-top:2px;"><span class="muted" style="font-size:12px;">${s.title} — ${s.artist}</span> <button class="btn danger" data-remove-song-everywhere="${s.id}" data-song-label="${s.title} — ${s.artist}" style="font-size:10px;padding:2px 6px;">Not a real song, remove entirely</button></div>`).join('')}` : ''}
-        ${d.recentlyMatched.length ? `<p class="muted" style="margin-top:6px;">Most recently matched:</p>${d.recentlyMatched.map(s => `<div class="muted" style="font-size:12px;">${s.title} — ${s.artist} &rarr; ${s.spotify_track_name} (${s.spotify_album_name})</div>`).join('')}` : ''}
-      `;
-      el.querySelectorAll('[data-remove-song-everywhere]').forEach(btn => btn.onclick = async () => {
-        const songId = btn.dataset.removeSongEverywhere;
-        const label = btn.dataset.songLabel;
-        if (!confirm(`Remove "${label}" from your entire dataset? This can't be undone.`)) return;
-        btn.disabled = true;
-        try {
-          const r = await api(`/api/songs/${songId}/remove-everywhere`, { method: 'POST' });
-          btn.closest('.row').innerHTML = `<span class="success" style="font-size:12px;">Removed from ${fmt(r.removed)} show(s).</span>`;
-        } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
-      });
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  document.getElementById('playlist-sizes-btn').onclick = async () => {
-    const el = document.getElementById('playlist-sizes-result');
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api('/api/spotify/playlist-sizes');
-      el.innerHTML = d.results.map(r => r.error
-        ? `<p class="error">${r.label}: failed — ${r.error}</p>`
-        : `<p class="muted">${r.label}: <b>${fmt(r.size)}</b> tracks read</p>`
-      ).join('');
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
-  document.getElementById('song-lookup-btn').onclick = async () => {
-    const el = document.getElementById('song-lookup-result');
-    const title = document.getElementById('song-lookup-title').value.trim();
-    if (!title) return;
-    el.innerHTML = '<p class="muted">Checking...</p>';
-    try {
-      const d = await api(`/api/songs/lookup?title=${encodeURIComponent(title)}`);
-      if (!d.songs.length) { el.innerHTML = '<p class="muted">No song records match that title.</p>'; return; }
-      el.innerHTML = d.songs.map(s => `
-        <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
-          <div><b>${s.title}</b> — ${s.artist} <span class="muted">(song id: ${s.id}, status: ${s.spotify_status})</span></div>
-          ${s.occurrences.length
-            ? s.occurrences.map(o => `<div class="muted" style="margin-left:12px;">${new Date(o.date).toLocaleDateString()}, ${o.venue} (${o.artist}) — source: ${o.setlist_source}</div>`).join('')
-            : '<div class="muted" style="margin-left:12px;">Not attached to any show right now.</div>'}
-        </div>
-      `).join('');
-    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
-  };
   wireAllShowsBrowser();
 }
 
 async function runGapCheck() {
   const resultsEl = document.getElementById('gapcheck-results');
-  resultsEl.innerHTML = '<p class="muted">Checking for songs already matched but not yet added...</p>';
+  resultsEl.innerHTML = '<p class="muted">Searching Spotify for unmatched songs...</p>';
   let excludeIds = [];
-  let totalAutoMarked = 0;
-  let allAdditions = [];
-  let totalNoCandidates = 0;
-
-  // Anything already matched (from this run or a past interrupted one) that
-  // hasn't been pushed to a playlist yet — surfaced here first so nothing
-  // found before ever gets lost or requires a separate button to see.
-  try {
-    const pending = await api('/api/spotify/pending-additions');
-    allAdditions = allAdditions.concat(pending.pending);
-  } catch (e) { /* non-fatal — still proceed to the catalog search */ }
-
-  resultsEl.innerHTML = '<p class="muted">Searching Spotify for anything still unresolved...</p>';
+  let allResults = [];
   let frozenTotal = null;
   try {
     while (true) {
       const r = await api(`/api/spotify/gap-check?excludeIds=${excludeIds.join(',')}`);
-      if (frozenTotal === null) frozenTotal = r.total; // fixed denominator for this whole run — the server's own total can drift upward as un-resolvable songs accumulate in "attempted," which looked like a miscounting bug but was really just a shifting denominator
-      totalAutoMarked += r.autoMarked;
-      allAdditions = allAdditions.concat(r.needsAddition);
-      totalNoCandidates += r.noCandidates;
+      if (frozenTotal === null) frozenTotal = r.total;
+      allResults = allResults.concat(r.results);
       excludeIds = excludeIds.concat(r.attemptedIds);
       if (r.stoppedEarly) {
         const isQuota = /QUOTA_EXCEEDED/i.test(r.searchErrorMessage || '');
         const guidance = isQuota
           ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
           : 'This usually means the Spotify connection needs to be redone (Settings → Connect Spotify).';
-        resultsEl.innerHTML = copyableBlock(`Search stopped partway — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping; ${fmt(totalAutoMarked)} matched, ${fmt(totalNoCandidates)} had no Spotify match.`, 'error');
-        if (allAdditions.length) {
+        resultsEl.innerHTML = copyableBlock(`Search stopped partway — Spotify search is failing repeatedly: ${r.searchErrorMessage || 'unknown error'}. ${guidance} Checked ${fmt(r.processed)} songs before stopping.`, 'error');
+        if (allResults.length) {
           const wrap = document.createElement('div');
-          wrap.innerHTML = `<p class="muted" style="margin-top:10px;">Even though the search stopped early, ${fmt(allAdditions.length)} song(s) are still ready to review below.</p>`;
+          wrap.innerHTML = `<p class="muted" style="margin-top:10px;">Even though the search stopped early, ${fmt(allResults.length)} song(s) were checked — reviewable below.</p>`;
           resultsEl.appendChild(wrap);
-          renderAdditionsApprovalList(resultsEl, allAdditions, true);
+          renderUnmatchedList(resultsEl, allResults, true);
         }
         return;
       }
@@ -680,85 +583,95 @@ async function runGapCheck() {
     }
   } catch (e) { resultsEl.innerHTML = copyableBlock(e.message, 'error'); return; }
 
-  const parts = [];
-  if (totalAutoMarked) parts.push(`<p class="success">${fmt(totalAutoMarked)} song(s) were already in the right playlist — dataset updated, nothing to add.</p>`);
-  if (!allAdditions.length) {
-    if (!totalAutoMarked) parts.push(`<p class="muted">Nothing missing (${fmt(totalNoCandidates)} songs had no Spotify match at all — check these manually if that seems wrong).</p>`);
-    resultsEl.innerHTML = parts.join('');
+  if (!allResults.length) {
+    resultsEl.innerHTML = '<p class="muted">Nothing unmatched — every song already has a Spotify track.</p>';
     return;
   }
-  resultsEl.innerHTML = parts.join('');
-  renderAdditionsApprovalList(resultsEl, allAdditions, true);
+  resultsEl.innerHTML = `<p class="muted">${fmt(allResults.length)} unmatched song(s) checked. Click one to review and sync it.</p>`;
+  renderUnmatchedList(resultsEl, allResults, true);
 }
 
-// Shared by both the live gap-check run and the durable pending-additions
-// check — same approve/skip UI either way, so a match found in a past
-// interrupted run gets exactly the same review experience as one found
-// just now.
-const PLAYLIST_LABELS = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
-
-function renderAdditionsApprovalList(container, additions, append) {
+// One row per unmatched song, collapsed by default — clicking expands an
+// abbreviated review: pick a candidate (or search manually), and syncing
+// happens immediately as part of the same click, straight to whichever
+// playlists actually apply for that song.
+function renderUnmatchedList(container, results, append) {
   const wrap = document.createElement('div');
-
-  // Counts per playlist, for the summary + filter pills — an item can count
-  // toward more than one playlist if it applies to several companions.
-  const counts = { seen: 0, wes: 0, dad: 0 };
-  additions.forEach(a => a.targets.forEach(t => { if (counts[t] !== undefined) counts[t]++; }));
-  const filterKeys = Object.keys(counts).filter(k => counts[k] > 0);
-  let activeFilter = 'all';
-
-  function rowsHtml(list) {
-    return list.map(a => `
-      <div class="song-row" data-gap-song="${a.songId}">
-        <img class="art" src="${a.track.albumArtUrl || ''}" />
-        <div style="flex:1;min-width:0;">
-          <div>${a.title} — ${a.artist}</div>
-          <div class="muted">${a.track.albumName} &middot; missing from: ${a.targets.map(t => PLAYLIST_LABELS[t] || t).join(', ')}</div>
-        </div>
-        <button class="btn danger" data-gap-drop="${a.songId}">Skip</button>
+  wrap.innerHTML = results.map(r => `
+    <div class="song-row" data-unmatched-song="${r.songId}" style="cursor:pointer;">
+      <div style="flex:1;min-width:0;">
+        <div>${r.title} — ${r.artist}</div>
+        <div class="muted">${r.candidates.length ? `${r.candidates.length} possible match(es) found` : 'no Spotify match found — search manually'}</div>
       </div>
-    `).join('');
-  }
-
-  wrap.innerHTML = `
-    ${filterKeys.length > 1 ? `
-      <div class="row" style="margin-bottom:10px;">
-        <button class="btn secondary filter-pill active" data-filter="all">All (${fmt(additions.length)})</button>
-        ${filterKeys.map(k => `<button class="btn secondary filter-pill" data-filter="${k}">${PLAYLIST_LABELS[k]} (${fmt(counts[k])})</button>`).join('')}
-      </div>
-    ` : ''}
-    <div id="gap-additions">${rowsHtml(additions)}</div>
-    <button class="btn" id="apply-gap-additions-btn" style="margin-top:10px;">Add ${fmt(additions.length)} song(s) to playlists</button>
-  `;
+      <button class="btn secondary" data-expand-song="${r.songId}">Review</button>
+    </div>
+    <div id="unmatched-detail-${r.songId}"></div>
+  `).join('');
   if (append) { container.appendChild(wrap); } else { container.innerHTML = ''; container.appendChild(wrap); }
 
-  const skipped = new Set();
-  function wireRowButtons() {
-    wrap.querySelectorAll('[data-gap-drop]').forEach(btn => btn.onclick = () => {
-      skipped.add(Number(btn.dataset.gapDrop));
-      btn.closest('.song-row').style.opacity = '0.3';
-      btn.disabled = true;
-    });
-  }
-  wireRowButtons();
-
-  wrap.querySelectorAll('.filter-pill').forEach(pill => pill.onclick = () => {
-    activeFilter = pill.dataset.filter;
-    wrap.querySelectorAll('.filter-pill').forEach(p => p.classList.toggle('active', p === pill));
-    const visible = activeFilter === 'all' ? additions : additions.filter(a => a.targets.includes(activeFilter));
-    document.getElementById('gap-additions').innerHTML = rowsHtml(visible);
-    wireRowButtons();
+  wrap.querySelectorAll('[data-expand-song]').forEach(btn => btn.onclick = () => {
+    const songId = Number(btn.dataset.expandSong);
+    const r = results.find(x => x.songId === songId);
+    const detail = document.getElementById(`unmatched-detail-${songId}`);
+    if (detail.dataset.open === 'true') { detail.innerHTML = ''; detail.dataset.open = 'false'; return; }
+    detail.dataset.open = 'true';
+    detail.innerHTML = `
+      ${r.candidates.map(c => `
+        <div class="song-row" style="margin:6px 0 0 20px;">
+          <img class="art" src="${c.albumArtUrl || ''}" />
+          <div style="flex:1;min-width:0;">
+            <div>${c.name}</div>
+            <div class="muted">${c.artist} &middot; ${c.albumName}</div>
+          </div>
+          <button class="btn secondary" data-sync-pick="${songId}" data-candidate-key="${stashCandidate(c)}">Use &amp; sync</button>
+        </div>
+      `).join('')}
+      <div class="row" style="margin:6px 0 0 20px;">
+        <input id="um-title-${songId}" value="${r.title}" style="max-width:200px;" />
+        <input id="um-artist-${songId}" value="${r.artist}" style="max-width:160px;" />
+        <button class="btn secondary" id="um-search-${songId}">Search Spotify</button>
+      </div>
+      <div id="um-results-${songId}" style="margin-left:20px;"></div>
+    `;
+    detail.querySelectorAll('[data-sync-pick]').forEach(pickBtn => pickBtn.onclick = () => syncPickedTrack(songId, candidateStore[pickBtn.dataset.candidateKey], detail));
+    document.getElementById(`um-search-${songId}`).onclick = async () => {
+      const resultsBox = document.getElementById(`um-results-${songId}`);
+      resultsBox.innerHTML = '<p class="muted">Searching...</p>';
+      const query = document.getElementById(`um-title-${songId}`).value;
+      const artist = document.getElementById(`um-artist-${songId}`).value;
+      try {
+        const found = await api('/api/spotify/search', { method: 'POST', body: { query, artist } });
+        if (!found.length) { resultsBox.innerHTML = '<p class="muted">No results.</p>'; return; }
+        resultsBox.innerHTML = found.slice(0, 8).map(c => `
+          <div class="song-row" style="margin-top:6px;">
+            <img class="art" src="${c.albumArtUrl || ''}" />
+            <div style="flex:1;min-width:0;">
+              <div>${c.name}</div>
+              <div class="muted">${c.artist} &middot; ${c.albumName}</div>
+            </div>
+            <button class="btn secondary" data-sync-pick="${songId}" data-candidate-key="${stashCandidate(c)}">Use &amp; sync</button>
+          </div>
+        `).join('');
+        resultsBox.querySelectorAll('[data-sync-pick]').forEach(pickBtn => pickBtn.onclick = () => syncPickedTrack(songId, candidateStore[pickBtn.dataset.candidateKey], detail));
+      } catch (e) { resultsBox.innerHTML = `<p class="error">${e.message}</p>`; }
+    };
   });
-
-  wrap.querySelector('#apply-gap-additions-btn').onclick = async () => {
-    const toApply = additions.filter(a => !skipped.has(a.songId));
-    try {
-      const applied = await api('/api/spotify/gap-check/apply', { method: 'POST', body: { additions: toApply } });
-      wrap.innerHTML = `<p class="success">Added ${applied.added} song(s).${applied.skippedAlreadyPresent ? ` (${applied.skippedAlreadyPresent} were already in the playlist — skipped instead of duplicated.)` : ''}</p>`;
-      renderSync();
-    } catch (e) { showModal(e.message, { title: 'Error' }); }
-  };
 }
+
+async function syncPickedTrack(songId, track, detailEl) {
+  detailEl.innerHTML = '<p class="muted">Syncing...</p>';
+  try {
+    const r = await api('/api/spotify/confirm-and-sync', { method: 'POST', body: { songId, track } });
+    const parts = [];
+    if (r.addedTo.length) parts.push(`Added to: ${r.addedTo.map(k => PLAYLIST_LABELS[k] || k).join(', ')}`);
+    if (r.alreadyIn.length) parts.push(`Already in: ${r.alreadyIn.map(k => PLAYLIST_LABELS[k] || k).join(', ')}`);
+    detailEl.innerHTML = `<p class="success" style="margin-left:20px;">${track.name} — ${parts.join(' · ') || 'Matched.'}</p>`;
+    wireAllShowsBrowser(); // refresh the not-matched/not-added badges so they reflect this change immediately
+  } catch (e) { detailEl.innerHTML = `<p class="error" style="margin-left:20px;">${e.message}</p>`; }
+}
+
+const PLAYLIST_LABELS = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
+
 
 
 
