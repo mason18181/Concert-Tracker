@@ -15,6 +15,8 @@ async function sfmFetch(path) {
 
 // Pulls every setlist the given setlist.fm username has marked "I was there",
 // paginating until fewer than a full page comes back.
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function getAttendedShows(username) {
   const all = [];
   let page = 1;
@@ -28,6 +30,7 @@ async function getAttendedShows(username) {
     all.push(...data.setlist);
     if (data.setlist.length < (data.itemsPerPage || 20)) break;
     page += 1;
+    await sleep(300);
   }
   return all;
 }
@@ -73,4 +76,4 @@ async function searchSetlistsByArtistAndDate(artistName, isoDate) {
   return data && data.setlist ? data.setlist : [];
 }
 
-module.exports = { getAttendedShows, getSetlist, searchSetlistsByArtist, searchSetlistsByArtistAndDate, flattenSetlistSongs };
+module.exports = { getAttendedShows, getSetlist, searchSetlistsByArtist, searchSetlistsByArtistAndDate, flattenSetlistSongs, sleep };
