@@ -499,6 +499,20 @@ app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
          WHERE sa.artist ILIKE $1 ORDER BY sh.date DESC`,
         [`%${req.query.artist}%`]
       )).rows;
+      // For any row that has a URL but no ID (which is exactly the state
+      // that breaks the real attendance check, since it compares by ID
+      // only), re-run the actual search live and show the raw result —
+      // this tells us definitively whether setlist.fm's response has a
+      // usable id right now, or whether the gap is something else.
+      for (const row of artistLookup) {
+        if (row.setlistfm_url && !row.setlistfm_id) {
+          try {
+            const isoDate = new Date(row.date).toISOString().slice(0, 10);
+            const fresh = await setlistfm.searchSetlistsByArtistAndDate(row.artist, isoDate);
+            row.freshSearchRaw = fresh.map(c => ({ id: c.id, url: c.url, venue: c.venue ? c.venue.name : null }));
+          } catch (e) { row.freshSearchError = e.message; }
+        }
+      }
     }
     res.json({
       username: cfg.setlistfm_username,
@@ -1758,20 +1772,7 @@ app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
 
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const limit = 40; // keeps each call well under a minute even including Spotify round-trips
-  // Song IDs already attempted this run (resolved or not) — passed back by
-  // the client each call. This is what actually fixes the skipping bug:
-  // OFFSET against a WHERE clause that shrinks as songs get resolved was
-  // silently skipping unresolved songs between batches. Excluding by ID
-  // instead means nothing gets skipped, whether it resolved or not.
   const excludeIds = (req.query.excludeIds ? req.query.excludeIds.split(',') : []).map(Number).filter(Number.isFinite);
-
-  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  const targetDefs = [
-    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
-    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
-    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
-  ];
-  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
 
   const totalRow = (await pool.query(`
     SELECT count(DISTINCT s.id) AS c
@@ -1791,12 +1792,10 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     LIMIT $2
   `, [excludeIds, limit])).rows;
 
-  let autoMarked = 0;
-  const needsAddition = [];
+  const results = [];
   const attemptedIds = [];
   let searchErrors = 0;
   let firstSearchError = null;
-  let noCandidates = 0;
   let stoppedEarly = false;
 
   for (const song of gapSongs) {
@@ -1807,57 +1806,62 @@ app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
     // attempted stay eligible for next run rather than being marked done.
     if (searchErrors >= 5) { stoppedEarly = true; break; }
 
-    // Which playlists does this song actually belong in, across every show it appears at?
-    const companionRows = (await pool.query(`
-      SELECT DISTINCT c.name FROM show_songs ss
-      JOIN show_artists sa ON sa.id = ss.show_artist_id
-      JOIN show_companions sc ON sc.show_id = sa.show_id
-      JOIN companions c ON c.id = sc.companion_id
-      WHERE ss.song_id = $1
-    `, [song.id])).rows.map(r => r.name);
-    const applicableTargets = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
-
     let candidates = [];
     try { candidates = await spotify.searchTrack(song.title, song.artist); }
     catch (e) { searchErrors++; firstSearchError = firstSearchError || e.message; continue; }
     attemptedIds.push(song.id);
     await ors.sleep(120);
-    const best = candidates[0];
-    if (!best) { noCandidates++; continue; }
-
-    const missingFrom = applicableTargets.filter(t => !playlistIdSets[t.key].has(best.id));
-    const alreadyIn = applicableTargets.filter(t => playlistIdSets[t.key].has(best.id));
-
-    // The match itself gets saved the instant it's found, no matter what —
-    // this is what actually fixes losing 280 real matches to a quota
-    // interruption. Only the PLAYLIST PUSH (a deliberate Spotify write)
-    // waits for approval; the song-to-track tie is never at risk again.
-    await pool.query(
-      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
-      [best.id, best.name, best.albumName, best.albumArtUrl, song.id]
-    );
-
-    if (alreadyIn.length) {
-      // The playlist already has it — the dataset was just out of date.
-      for (const t of alreadyIn) {
-        await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${t.key}=true WHERE song_id=$1`, [song.id]);
-      }
-      autoMarked++;
-    }
-    if (missingFrom.length) {
-      needsAddition.push({
-        songId: song.id, artist: song.artist, title: song.title, track: best,
-        targets: missingFrom.map(t => t.key),
-      });
-    }
+    results.push({ songId: song.id, title: song.title, artist: song.artist, candidates: candidates.slice(0, 3) });
   }
 
   const processedSoFar = excludeIds.length + attemptedIds.length;
   res.json({
-    autoMarked, needsAddition, total, attemptedIds, processed: processedSoFar,
+    results, total, attemptedIds, processed: processedSoFar,
     done: !stoppedEarly && gapSongs.length < limit,
-    noCandidates, searchErrors, searchErrorMessage: firstSearchError, stoppedEarly,
+    searchErrors, searchErrorMessage: firstSearchError, stoppedEarly,
   });
+});
+
+// The "abbreviated sync" step — you've already reviewed and picked a
+// track; this ties the song to it and immediately pushes to whichever
+// playlists actually apply (based on who was at the shows it appears at),
+// skipping anything already genuinely present rather than duplicating it.
+app.post('/api/spotify/confirm-and-sync', requireAuth, async (req, res) => {
+  const { songId, track } = req.body;
+  await pool.query(
+    `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+    [track.id, track.name, track.albumName, track.albumArtUrl, songId]
+  );
+
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ].filter(t => t.playlistId);
+
+  const companionRows = (await pool.query(`
+    SELECT DISTINCT c.name FROM show_songs ss
+    JOIN show_artists sa ON sa.id = ss.show_artist_id
+    JOIN show_companions sc ON sc.show_id = sa.show_id
+    JOIN companions c ON c.id = sc.companion_id
+    WHERE ss.song_id = $1
+  `, [songId])).rows.map(r => r.name);
+  const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
+
+  const addedTo = [], alreadyIn = [];
+  for (const t of applicable) {
+    let currentIds;
+    try { currentIds = await spotify.getPlaylistTrackIds(t.playlistId); } catch (e) { currentIds = new Set(); }
+    if (currentIds.has(track.id)) {
+      alreadyIn.push(t.key);
+    } else {
+      try { await spotify.addTracksToPlaylist(t.playlistId, [`spotify:track:${track.id}`]); addedTo.push(t.key); }
+      catch (e) { /* leave it off addedTo — flag stays false, will be retried next reconcile */ continue; }
+    }
+    await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${t.key}=true WHERE song_id=$1`, [songId]);
+  }
+  res.json({ ok: true, addedTo, alreadyIn });
 });
 
 // Durable version of "needs playlist push" — unlike gap-check's own
