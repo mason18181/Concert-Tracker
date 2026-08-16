@@ -114,6 +114,32 @@ async function fetchSpotify(url, options, attempt = 1) {
   return res;
 }
 
+async function searchTrackDebug(title, artist) {
+  const token = await getAccessToken();
+  async function runQuery(q) {
+    const res = await fetchSpotify(`${API_BASE}/search?type=track&limit=10&q=${encodeURIComponent(q)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { error: `${res.status}: ${await res.text()}` };
+    const data = await res.json();
+    const items = (data.tracks && data.tracks.items) || [];
+    return { items };
+  }
+  const strictQuery = artist ? `track:"${title}" artist:"${artist}"` : `track:"${title}"`;
+  const broadQuery = artist ? `${title} ${artist}` : title;
+  const strictResult = await runQuery(strictQuery);
+  const broadResult = await runQuery(broadQuery);
+  return {
+    strictQuery, broadQuery,
+    strictError: strictResult.error || null,
+    strictCount: strictResult.items ? strictResult.items.length : 0,
+    strictSample: strictResult.items ? strictResult.items.slice(0, 3).map(t => `${t.name} — ${t.artists.map(a => a.name).join(', ')} (${t.album.name})`) : [],
+    broadError: broadResult.error || null,
+    broadCount: broadResult.items ? broadResult.items.length : 0,
+    broadSample: broadResult.items ? broadResult.items.slice(0, 3).map(t => `${t.name} — ${t.artists.map(a => a.name).join(', ')} (${t.album.name})`) : [],
+  };
+}
+
 async function searchTrack(title, artist) {
   const token = await getAccessToken();
 
@@ -232,4 +258,4 @@ async function removeTracksFromPlaylist(playlistId, trackUris) {
   }
 }
 
-module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, addTracksToPlaylist, getPlaylistTrackIds, getPlaylistTracksFull, removeTracksFromPlaylist };
+module.exports = { getAuthUrl, exchangeCodeForToken, getAccessToken, searchTrack, searchTrackDebug, addTracksToPlaylist, getPlaylistTrackIds, getPlaylistTracksFull, removeTracksFromPlaylist };
