@@ -409,7 +409,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
     { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
     { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
   ].filter(t => t.playlistId);
-  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
+  const { sets: playlistIdSets, failures: playlistReadFailures } = await getCachedPlaylistIdSets(targetDefs);
 
   const rows = (await pool.query(`
     SELECT sh.id AS show_id, ss.id AS show_song_id, s.spotify_track_id,
@@ -429,7 +429,10 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
     const bucket = (countsByShowId[r.show_id] = countsByShowId[r.show_id] || { unmatched: 0, notAdded: 0 });
     if (!r.spotify_track_id) { bucket.unmatched++; continue; }
     const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && r.companions.includes('Wes')) || (t.key === 'dad' && r.companions.includes('Jeff')));
-    const missing = applicable.some(t => !playlistIdSets[t.key].has(r.spotify_track_id));
+    // A playlist we couldn't read (playlistIdSets[key] === null) is never
+    // treated as evidence a song is missing from it — only a confirmed,
+    // successful read that genuinely doesn't contain the song counts.
+    const missing = applicable.some(t => playlistIdSets[t.key] && !playlistIdSets[t.key].has(r.spotify_track_id));
     if (missing) bucket.notAdded++;
   }
 
@@ -443,7 +446,7 @@ app.get('/api/shows/all', requireAuth, async (req, res) => {
     sh.unmatchedCount = c.unmatched;
     sh.notAddedCount = c.notAdded;
   }
-  res.json(shows);
+  res.json({ shows, playlistReadFailures });
 });
 
 // Manual fallback in case the automatic setlist.fm check below ever
@@ -507,6 +510,7 @@ app.get('/api/setlistfm/attended-debug', requireAuth, async (req, res) => {
       for (const row of artistLookup) {
         if (row.setlistfm_url && !row.setlistfm_id) {
           try {
+            await setlistfm.sleep(300); // getAttendedShows just ran right before this — give setlist.fm's rate limit room to breathe
             const isoDate = new Date(row.date).toISOString().slice(0, 10);
             const fresh = await setlistfm.searchSetlistsByArtistAndDate(row.artist, isoDate);
             row.freshSearchRaw = fresh.map(c => ({ id: c.id, url: c.url, venue: c.venue ? c.venue.name : null }));
@@ -1424,28 +1428,15 @@ app.get('/api/report/unknowns', requireAuth, async (req, res) => {
 app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
   const cIds = companionIdsParam(req);
   const rows = (await pool.query(`
-    SELECT artist, title FROM (
-      SELECT s.artist, s.title
-      FROM show_songs ss
-      JOIN show_artists sa ON sa.id = ss.show_artist_id
-      JOIN shows sh ON sh.id = sa.show_id
-      JOIN songs s ON s.id = ss.song_id
-      WHERE sh.setlistfm_event_id IS NULL
-        AND ss.already_on_spotify = false
-        AND ss.status = 'seen'
-        AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
-      UNION
-      SELECT s.artist, s.title
-      FROM show_songs ss
-      JOIN show_artists sa ON sa.id = ss.show_artist_id
-      JOIN shows sh ON sh.id = sa.show_id
-      JOIN songs s ON s.id = ss.song_id
-      WHERE sh.setlistfm_event_id IS NOT NULL
-        AND s.spotify_status = 'excluded'
-        AND ss.status = 'seen'
-        AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
-    ) gaps
-    ORDER BY artist ASC, title ASC
+    SELECT DISTINCT s.artist, s.title
+    FROM show_songs ss
+    JOIN show_artists sa ON sa.id = ss.show_artist_id
+    JOIN shows sh ON sh.id = sa.show_id
+    JOIN songs s ON s.id = ss.song_id
+    WHERE ss.status = 'seen'
+      AND s.spotify_track_id IS NULL
+      AND ($1::int[] IS NULL OR sh.id IN (SELECT show_id FROM show_companions WHERE companion_id = ANY($1::int[])))
+    ORDER BY s.artist ASC, s.title ASC
   `, [cIds])).rows;
   res.json({ songs: rows });
 });
@@ -1466,14 +1457,24 @@ app.get('/api/report/spotify-gaps', requireAuth, async (req, res) => {
 // 10 minutes, long enough to cover one full run.
 let playlistCache = { at: 0, sets: null };
 async function getCachedPlaylistIdSets(targetDefs) {
-  if (playlistCache.sets && Date.now() - playlistCache.at < 10 * 60 * 1000) return playlistCache.sets;
+  if (playlistCache.sets && Date.now() - playlistCache.at < 10 * 60 * 1000) return playlistCache;
   const sets = {};
+  const failures = [];
   for (const t of targetDefs) {
     try { sets[t.key] = await spotify.getPlaylistTrackIds(t.playlistId); }
-    catch (e) { sets[t.key] = new Set(); }
+    catch (e) {
+      // null means "couldn't verify" — never treated as proof a song is
+      // missing. Silently falling back to an empty Set here (as this used
+      // to) meant a single transient read failure made every song in that
+      // playlist look "missing," and caching that failure locked in the
+      // wrong answer for a full 10 minutes.
+      sets[t.key] = null;
+      failures.push(t.key);
+    }
   }
-  playlistCache = { at: Date.now(), sets };
-  return sets;
+  const result = { sets, failures };
+  if (!failures.length) playlistCache = { at: Date.now(), sets, failures: [] }; // only cache a fully successful read
+  return result;
 }
 
 // Queries the database directly for how many songs actually have a real
@@ -1490,286 +1491,6 @@ async function getCachedPlaylistIdSets(targetDefs) {
 // Cached (10 min) per-playlist lookup maps, built from a full track fetch —
 // expensive to build once, so batches reuse it instead of re-fetching your
 // whole playlist on every chunk.
-let playlistLookupCache = { at: 0, lookups: null };
-async function getCachedPlaylistLookups(targetDefs) {
-  if (playlistLookupCache.lookups && Date.now() - playlistLookupCache.at < 10 * 60 * 1000) return playlistLookupCache;
-  const lookups = {};
-  const failures = [];
-  for (const t of targetDefs) {
-    try {
-      const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
-      const map = new Map();
-      for (const track of tracks) {
-        const normTitle = normalizeTitle(track.name);
-        for (const artistName of track.artists) {
-          map.set(`${artistKey(artistName)}|${normTitle}`, track);
-        }
-      }
-      lookups[t.key] = map;
-    } catch (e) {
-      // One playlist failing (wrong ID, belongs to a different account,
-      // whatever it turns out to be) shouldn't block matching against the
-      // others — this used to abort the whole operation on any single
-      // failure, which is exactly what made a Wes/Dad playlist problem
-      // silently block Seen In Concert too.
-      failures.push({ key: t.key, error: e.message });
-      lookups[t.key] = new Map();
-    }
-  }
-  playlistLookupCache = { at: Date.now(), lookups, failures };
-  return playlistLookupCache;
-}
-
-// The right first step for the historical backlog: instead of searching
-// Spotify's whole catalog per song (slow, quota-hungry, and picks a version
-// you didn't choose), fetch Seen In Concert once and match locally against
-// what you've already curated there. A match here needs no approval — it's
-// not a new decision, just recognizing a song that's already exactly where
-// you put it. Deliberately scoped to Seen In Concert only — this is about
-// tying every song to a real track ID, not about which companion playlists
-// a song needs to land in (that's what gaps check handles). Batched the
-// same way as gap-check (excludeIds, not offset) so a large backlog shows
-// real progress instead of one long silent request.
-function levenshtein(a, b) {
-  const dp = [];
-  for (let i = 0; i <= a.length; i++) dp.push([i, ...Array(b.length).fill(0)]);
-  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-    }
-  }
-  return dp[a.length][b.length];
-}
-function titleSimilarity(a, b) {
-  const dist = levenshtein(a, b);
-  const maxLen = Math.max(a.length, b.length) || 1;
-  return 1 - dist / maxLen;
-}
-
-// For the songs "Match from my playlists" couldn't resolve with an exact
-// title match — this looks for a close (not exact) match within Seen In
-// Concert specifically, and only Seen In Concert. It never searches
-// Spotify's wider catalog and never compares against Wes/Dad's playlists —
-// this is purely "what in Seen In Concert probably represents this song,"
-// surfaced for you to confirm, not auto-applied since fuzzy matches are
-// inherently less certain than exact ones.
-let seenTracksCache = { at: 0, tracks: null };
-async function getCachedSeenTracks(playlistId) {
-  if (seenTracksCache.tracks && Date.now() - seenTracksCache.at < 10 * 60 * 1000) return seenTracksCache.tracks;
-  const tracks = await spotify.getPlaylistTracksFull(playlistId);
-  seenTracksCache = { at: Date.now(), tracks };
-  return tracks;
-}
-
-// For the fuzzy-match tool's "search manually" fallback — deliberately
-// searches only within Seen In Concert's own tracks, never Spotify's wider
-// catalog, since the whole point here is "what in the playlist represents
-// this song," not finding a new candidate that isn't in the playlist yet.
-app.post('/api/spotify/search-within-seen', requireAuth, async (req, res) => {
-  const { query, artist } = req.body;
-  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
-  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
-  if (!playlistId) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured.' });
-
-  const tracks = await getCachedSeenTracks(playlistId);
-  const normQuery = normalizeTitle(query || '');
-  const artistFilter = artist ? artistKey(artist) : null;
-
-  const scored = tracks
-    .filter(t => !artistFilter || t.artists.some(a => artistKey(a).includes(artistFilter) || artistFilter.includes(artistKey(a))))
-    .map(t => ({ track: t, score: titleSimilarity(normQuery, normalizeTitle(t.name)) }))
-    .filter(s => s.score >= 0.3 || normalizeTitle(s.track.name).includes(normQuery) || normQuery.includes(normalizeTitle(s.track.name)))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 8);
-
-  res.json(scored.map(s => ({
-    id: s.track.id, name: s.track.name, artist: s.track.artists.join(', '),
-    albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100),
-  })));
-});
-
-app.get('/api/spotify/fuzzy-match-seen', requireAuth, async (req, res) => {
-  const cfg = (await pool.query('SELECT seen_playlist_id FROM config WHERE id=1')).rows[0];
-  const playlistId = extractPlaylistId(cfg.seen_playlist_id);
-  if (!playlistId) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured.' });
-
-  const tracks = await getCachedSeenTracks(playlistId);
-  const byArtist = {};
-  for (const t of tracks) {
-    for (const a of t.artists) {
-      const key = artistKey(a);
-      (byArtist[key] = byArtist[key] || []).push(t);
-    }
-  }
-
-  const unresolved = (await pool.query(`
-    SELECT DISTINCT s.id, s.artist, s.title
-    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
-    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
-    ORDER BY s.artist, s.title
-  `)).rows;
-
-  const results = [];
-  for (const song of unresolved) {
-    const candidateTracks = byArtist[artistKey(song.artist)] || [];
-    const normTitle = normalizeTitle(song.title);
-    const scored = candidateTracks
-      .map(t => ({ track: t, score: titleSimilarity(normTitle, normalizeTitle(t.name)) }))
-      .filter(s => s.score >= 0.5)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 3);
-    results.push({
-      songId: song.id, title: song.title, artist: song.artist,
-      candidates: scored.map(s => ({ id: s.track.id, name: s.track.name, artist: song.artist, albumName: s.track.albumName, albumArtUrl: s.track.albumArtUrl, score: Math.round(s.score * 100) })),
-    });
-  }
-  res.json({ results, totalUnresolved: unresolved.length, withCandidates: results.filter(r => r.candidates.length).length });
-});
-
-app.post('/api/spotify/fuzzy-match-seen/apply', requireAuth, async (req, res) => {
-  const { songId, track } = req.body;
-  await pool.query(
-    `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
-    [track.id, track.name, track.albumName, track.albumArtUrl, songId]
-  );
-  await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_seen=true WHERE song_id=$1`, [songId]);
-  res.json({ ok: true });
-});
-
-app.post('/api/spotify/match-from-playlists', requireAuth, async (req, res) => {
-  const limit = 200; // cheap per-item (local lookup + one DB write), so a bigger batch than gap-check's is fine
-  const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
-
-  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  if (!cfg.seen_playlist_id) return res.status(400).json({ error: 'No "Seen In Concert" playlist ID configured in Settings.' });
-  const targetDefs = [{ key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) }];
-
-  let lookups, playlistFailures;
-  try {
-    const cache = await getCachedPlaylistLookups(targetDefs);
-    lookups = cache.lookups;
-    playlistFailures = cache.failures;
-  } catch (e) {
-    // Safety net only — getCachedPlaylistLookups now catches per-playlist
-    // failures internally, so this should only fire on something truly
-    // unexpected (e.g. the config query itself failing).
-    const isQuota = e.isQuotaExceeded || /QUOTA_EXCEEDED/i.test(e.message || '');
-    const isForbidden = /"status"\s*:\s*403/.test(e.message || '');
-    const guidance = isQuota
-      ? "Spotify's daily usage limit for this app has been used up — this isn't something reconnecting fixes. It resets on its own; try again in a few hours or tomorrow."
-      : isForbidden
-      ? "This usually means the connected Spotify account doesn't have permission to read one of these playlists — go to Settings and click Connect Spotify again. Make sure you actually see Spotify's permission screen this time (it should list reading your playlists, not just modifying them) — if it skips straight past without showing you anything to approve, that's the bug, not you."
-      : '';
-    return res.status(502).json({ error: `Couldn't read your playlists from Spotify: ${e.message}. ${guidance}` });
-  }
-
-  const totalRow = (await pool.query(`
-    SELECT count(DISTINCT s.id) AS c
-    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
-    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
-  `)).rows[0];
-  const total = Number(totalRow.c) + excludeIds.length;
-
-  const batch = (await pool.query(`
-    SELECT DISTINCT s.id, s.artist, s.title
-    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN songs s ON s.id = ss.song_id
-    WHERE ss.status = 'seen' AND s.spotify_track_id IS NULL
-      AND ($1::int[] = '{}' OR s.id != ALL($1::int[]))
-    ORDER BY s.id
-    LIMIT $2
-  `, [excludeIds, limit])).rows;
-
-  let matched = 0;
-  for (const song of batch) {
-    const key = `${artistKey(song.artist)}|${normalizeTitle(song.title)}`;
-    let track = null;
-    const foundInTargets = [];
-    for (const t of targetDefs) {
-      const hit = lookups[t.key].get(key);
-      if (hit) { track = track || hit; foundInTargets.push(t.key); }
-    }
-    if (!track) continue;
-
-    await pool.query(
-      `UPDATE songs SET spotify_status='matched', spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
-      [track.id, track.name, track.albumName, track.albumArtUrl, song.id]
-    );
-    for (const key2 of foundInTargets) {
-      await pool.query(`UPDATE show_songs SET already_on_spotify=true, added_to_${key2}=true WHERE song_id=$1`, [song.id]);
-    }
-    matched++;
-  }
-
-  const attemptedIds = batch.map(s => s.id);
-  const processed = excludeIds.length + attemptedIds.length;
-  res.json({ ok: true, matched, attemptedIds, processed, total, done: batch.length < limit, playlistFailures });
-});
-
-// Diagnostic: shows exactly how many tracks got read from each configured
-// playlist right now — if one comes back suspiciously low or zero despite
-// being a real, populated playlist, that's the actual cause of everything
-// in it looking "missing."
-app.get('/api/spotify/playlist-sizes', requireAuth, async (req, res) => {
-  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
-  const targetDefs = [
-    { key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
-    { key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
-    { key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
-  ].filter(t => t.playlistId);
-  const results = [];
-  for (const t of targetDefs) {
-    try {
-      const ids = await spotify.getPlaylistTrackIds(t.playlistId);
-      results.push({ label: t.label, size: ids.size, error: null });
-    } catch (e) {
-      results.push({ label: t.label, size: null, error: e.message });
-    }
-  }
-  res.json({ results });
-});
-
-app.get('/api/spotify/match-stats', requireAuth, async (req, res) => {
-  // Scoped to songs with at least one 'seen' occurrence — a song that's
-  // only ever been missed or skipped never needs a Spotify match at all,
-  // and counting it here (as the raw songs-table query used to) inflated
-  // "pending" with songs that don't actually need any action.
-  const byStatus = (await pool.query(`
-    SELECT s.spotify_status, count(DISTINCT s.id) AS c
-    FROM songs s JOIN show_songs ss ON ss.song_id = s.id
-    WHERE ss.status = 'seen'
-    GROUP BY s.spotify_status
-  `)).rows;
-  const totalSeen = (await pool.query(`
-    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id WHERE ss.status = 'seen'
-  `)).rows[0];
-  const missedOrSkippedOnly = (await pool.query(`
-    SELECT count(*) AS c FROM songs s
-    WHERE NOT EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id AND ss.status = 'seen')
-      AND EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id)
-  `)).rows[0];
-  const withRealTrack = (await pool.query(`
-    SELECT count(DISTINCT s.id) AS c FROM songs s JOIN show_songs ss ON ss.song_id = s.id
-    WHERE ss.status = 'seen' AND s.spotify_track_id IS NOT NULL
-  `)).rows[0];
-  const recentlyMatched = (await pool.query(
-    `SELECT title, artist, spotify_track_name, spotify_album_name FROM songs WHERE spotify_track_id IS NOT NULL ORDER BY id DESC LIMIT 10`
-  )).rows;
-  const excludedSongs = (await pool.query(
-    `SELECT id, title, artist FROM songs s WHERE spotify_status='excluded'
-     AND EXISTS (SELECT 1 FROM show_songs ss WHERE ss.song_id = s.id)
-     ORDER BY id DESC LIMIT 20`
-  )).rows;
-  res.json({
-    totalSongs: Number(totalSeen.c),
-    missedOrSkippedOnlyCount: Number(missedOrSkippedOnly.c),
-    withRealTrackId: Number(withRealTrack.c),
-    byStatus: Object.fromEntries(byStatus.map(r => [r.spotify_status, Number(r.c)])),
-    recentlyMatched,
-    excludedSongs,
-  });
-});
-
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const limit = 40; // keeps each call well under a minute even including Spotify round-trips
   const excludeIds = (req.query.excludeIds ? req.query.excludeIds.split(',') : []).map(Number).filter(Number.isFinite);
@@ -1876,7 +1597,7 @@ app.get('/api/spotify/pending-additions', requireAuth, async (req, res) => {
     { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
     { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
   ].filter(t => t.playlistId);
-  const playlistIdSets = await getCachedPlaylistIdSets(targetDefs);
+  const { sets: playlistIdSets } = await getCachedPlaylistIdSets(targetDefs);
 
   const matched = (await pool.query(`
     SELECT s.id AS song_id, s.title, s.artist, s.spotify_track_id, s.spotify_track_name, s.spotify_album_name, s.spotify_album_art_url
