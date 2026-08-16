@@ -6,7 +6,24 @@ function headers() {
   return { 'x-api-key': apiKey, Accept: 'application/json' };
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Every setlist.fm call goes through sfmFetch, so gating pacing here covers
+// every caller globally — including two different parts of the app
+// calling setlist.fm at the same time (e.g. the All Shows list's own
+// attended check running while a Settings diagnostic also fires). Per-
+// function local delays couldn't catch that overlap; this can.
+let lastCallAt = 0;
+const MIN_GAP_MS = 350;
+async function throttle() {
+  const now = Date.now();
+  const wait = Math.max(0, lastCallAt + MIN_GAP_MS - now);
+  lastCallAt = now + wait; // reserve the slot immediately, before awaiting, so a concurrent caller sees the updated time
+  if (wait > 0) await sleep(wait);
+}
+
 async function sfmFetch(path) {
+  await throttle();
   const res = await fetch(`${BASE}${path}`, { headers: headers() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`setlist.fm error ${res.status}: ${await res.text()}`);
@@ -15,8 +32,6 @@ async function sfmFetch(path) {
 
 // Pulls every setlist the given setlist.fm username has marked "I was there",
 // paginating until fewer than a full page comes back.
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 async function getAttendedShows(username) {
   const all = [];
   let page = 1;
@@ -30,7 +45,6 @@ async function getAttendedShows(username) {
     all.push(...data.setlist);
     if (data.setlist.length < (data.itemsPerPage || 20)) break;
     page += 1;
-    await sleep(300);
   }
   return all;
 }
