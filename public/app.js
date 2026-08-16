@@ -251,11 +251,61 @@ async function renderSettings() {
       <div class="muted" id="match-sfm-status" style="margin-top:8px;"></div>
     </div>
     <div class="card">
+      <h2>Investigate a song</h2>
+      <div class="row">
+        <input id="song-lookup-title" placeholder="Song title (e.g. Tim Montana song)" style="max-width:260px;" />
+        <button class="btn secondary" id="song-lookup-btn">Look up in dataset</button>
+      </div>
+      <div id="song-lookup-result" style="margin-top:8px;"></div>
+      <div class="row" style="margin-top:12px;">
+        <input id="search-debug-title" placeholder="Title to test-search" style="max-width:220px;" />
+        <input id="search-debug-artist" placeholder="Artist" style="max-width:180px;" />
+        <button class="btn secondary" id="search-debug-btn">Test Spotify search</button>
+      </div>
+      <div id="search-debug-result" style="margin-top:8px;"></div>
+    </div>
+    <div class="card">
       <h2>Session</h2>
       <button class="btn danger" id="lock-btn">Lock app</button>
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
     </div>
   `;
+  document.getElementById('song-lookup-btn').onclick = async () => {
+    const el = document.getElementById('song-lookup-result');
+    const title = document.getElementById('song-lookup-title').value.trim();
+    if (!title) return;
+    el.innerHTML = '<p class="muted">Checking...</p>';
+    try {
+      const d = await api(`/api/songs/lookup?title=${encodeURIComponent(title)}`);
+      if (!d.songs.length) { el.innerHTML = '<p class="muted">No song records match that title.</p>'; return; }
+      el.innerHTML = d.songs.map(s => `
+        <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
+          <div><b>${s.title}</b> — ${s.artist} <span class="muted">(id: ${s.id}, spotify_status: ${s.spotify_status}, track_id: ${s.spotify_track_id || 'none'})</span></div>
+          ${s.occurrences.length
+            ? s.occurrences.map(o => `<div class="muted" style="margin-left:12px;">${new Date(o.date).toLocaleDateString()}, ${o.venue} (${o.artist}) — status: ${o.status}</div>`).join('')
+            : '<div class="muted" style="margin-left:12px;">Not attached to any show right now.</div>'}
+        </div>
+      `).join('');
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
+  document.getElementById('search-debug-btn').onclick = async () => {
+    const el = document.getElementById('search-debug-result');
+    const title = document.getElementById('search-debug-title').value.trim();
+    const artist = document.getElementById('search-debug-artist').value.trim();
+    if (!title) return;
+    el.innerHTML = '<p class="muted">Searching...</p>';
+    try {
+      const d = await api('/api/spotify/search-debug', { method: 'POST', body: { title, artist } });
+      el.innerHTML = `
+        <div style="font-size:12px;">
+          <div class="muted">Strict query: <span style="font-family:monospace;">${d.strictQuery}</span></div>
+          ${d.strictError ? `<div class="error">Error: ${d.strictError}</div>` : `<div>${d.strictCount} result(s)${d.strictSample.length ? ': ' + d.strictSample.join(' | ') : ''}</div>`}
+          <div class="muted" style="margin-top:6px;">Broad fallback query: <span style="font-family:monospace;">${d.broadQuery}</span></div>
+          ${d.broadError ? `<div class="error">Error: ${d.broadError}</div>` : `<div>${d.broadCount} result(s)${d.broadSample.length ? ': ' + d.broadSample.join(' | ') : ''}</div>`}
+        </div>
+      `;
+    } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
   document.getElementById('sfm-debug-btn').onclick = async () => {
     const el = document.getElementById('sfm-debug-result');
     el.innerHTML = '<p class="muted">Checking...</p>';
@@ -612,13 +662,22 @@ async function wireAllShowsBrowser() {
       <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
         <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span>
           ${s.unmatchedCount ? ` <span class="pill" style="color:var(--danger);border-color:var(--danger);">${s.unmatchedCount} not matched</span>` : ''}
-          ${s.notAddedCount ? ` <span class="pill" style="color:var(--amber);border-color:var(--amber);">${s.notAddedCount} not in playlist</span>` : ''}
+          ${s.notAddedCount ? ` <button class="pill" data-show-detail="${s.id}" style="color:var(--amber);border-color:var(--amber);cursor:pointer;">${s.notAddedCount} not in playlist</button>` : ''}
         </div>
+        <div id="not-added-detail-${s.id}"></div>
         ${s.artists.map(artistBadge).join('')}
         <button class="btn secondary" data-edit-show="${s.id}" style="margin-top:4px;">Edit</button>
         <button class="btn danger" data-delete-show="${s.id}" style="margin-top:4px;">Delete</button>
       </div>
     `).join('') || '<p class="muted">No matches.</p>');
+
+    listEl.querySelectorAll('[data-show-detail]').forEach(btn => btn.onclick = () => {
+      const s = shows.find(x => x.id === Number(btn.dataset.showDetail));
+      const box = document.getElementById(`not-added-detail-${s.id}`);
+      if (box.dataset.open === 'true') { box.innerHTML = ''; box.dataset.open = 'false'; return; }
+      box.dataset.open = 'true';
+      box.innerHTML = s.notAddedDetail.map(d => `<div class="muted" style="font-size:12px;margin:2px 0;">${d.title} — ${d.artist}: missing from ${d.missingFrom.map(k => PLAYLIST_LABELS[k] || k).join(', ')}</div>`).join('');
+    });
 
     listEl.querySelectorAll('[data-edit-show]').forEach(btn => btn.onclick = () => {
       wizardShowId = Number(btn.dataset.editShow); wizardStage = 'tag'; renderWizard();
