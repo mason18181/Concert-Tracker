@@ -403,14 +403,8 @@ async function renderSync() {
       </div>
     </div>
     <div class="card">
-      <h2>Spotify matching</h2>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 1, one-time:</b> matches your existing songs against what's already in your playlists — fast, no approval needed, since it's just recognizing songs you've already added.</p>
-      <button class="btn secondary" id="match-playlist-btn">Match from my playlists</button>
-      <div id="match-playlist-result" style="margin-top:10px;margin-bottom:16px;"></div>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 1b, for leftovers:</b> for songs step 1 couldn't find an exact match for, this looks for a close (not exact) match — still scoped only to Seen In Concert, not the wider Spotify catalog. Nothing gets applied automatically; you pick the right one per song.</p>
-      <button class="btn secondary" id="fuzzy-match-btn">Fuzzy match against Seen In Concert</button>
-      <div id="fuzzy-match-result" style="margin-top:10px;margin-bottom:16px;"></div>
-      <p class="muted" style="margin-bottom:10px;"><b>Step 2, ongoing:</b> searches Spotify's catalog for songs with no match at all yet. Click into a song to review candidates (or search manually), and syncing to whichever playlists apply happens as part of that same step.</p>
+      <h2>Spotify gaps check</h2>
+      <p class="muted" style="margin-bottom:10px;">For songs in your dataset that aren't tied to a Spotify track yet — usually because they weren't available on Spotify at the time. Searches the catalog for each one; click into a song to review candidates (or search manually), and syncing to whichever playlists apply happens as part of that same step.</p>
       <button class="btn secondary" id="gapcheck-btn">Run gaps check</button>
       <div id="gapcheck-results" style="margin-top:12px;"></div>
     </div>
@@ -438,113 +432,6 @@ async function renderSync() {
   app.querySelectorAll('[data-show]').forEach(btn => {
     btn.onclick = () => { wizardShowId = Number(btn.dataset.show); wizardStage = btn.dataset.stage; renderWizard(); };
   });
-  document.getElementById('match-playlist-btn').onclick = async (e) => {
-    e.target.disabled = true;
-    const el = document.getElementById('match-playlist-result');
-    el.innerHTML = '<p class="muted">Fetching your playlists (one-time, this part has no progress bar but is usually quick)...</p>';
-    let excludeIds = [];
-    let totalMatched = 0;
-    let playlistFailures = [];
-    let frozenTotal = null;
-    const friendlyName = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
-    try {
-      while (true) {
-        const r = await api('/api/spotify/match-from-playlists', { method: 'POST', body: { excludeIds } });
-        if (frozenTotal === null) frozenTotal = r.total;
-        totalMatched += r.matched;
-        excludeIds = excludeIds.concat(r.attemptedIds);
-        playlistFailures = r.playlistFailures || [];
-        el.innerHTML = `<p class="muted">Matched ${fmt(totalMatched)} so far — checked ${fmt(r.processed)} of ${fmt(frozenTotal)} songs...</p>`;
-        if (r.done) break;
-      }
-      const failureHtml = playlistFailures.length
-        ? `<div style="margin-top:8px;">${playlistFailures.map(f => `<p class="error">Couldn't read ${friendlyName[f.key] || f.key}: ${f.error}</p>`).join('')}<p class="muted">Matching still ran against whichever playlists did work — this didn't block on the ones above.</p></div>`
-        : '';
-      el.innerHTML = `<p class="success">Matched ${fmt(totalMatched)} songs directly from your playlists. Use "Search Spotify catalog" below for whatever's still unresolved.</p>${failureHtml}`;
-    } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
-    e.target.disabled = false;
-  };
-  document.getElementById('fuzzy-match-btn').onclick = async (e) => {
-    e.target.disabled = true;
-    const el = document.getElementById('fuzzy-match-result');
-    el.innerHTML = '<p class="muted">Comparing against Seen In Concert...</p>';
-    try {
-      const d = await api('/api/spotify/fuzzy-match-seen');
-      if (!d.results.length) {
-        el.innerHTML = `<p class="muted">Nothing unresolved — everything's already matched.</p>`;
-        e.target.disabled = false;
-        return;
-      }
-      el.innerHTML = `<p class="muted">${fmt(d.withCandidates)} of ${fmt(d.totalUnresolved)} unresolved song(s) had a close match in Seen In Concert; the rest have a manual search option instead. Review each below.</p>
-        <div id="fuzzy-rows">${d.results.map(r => `
-          <div data-fuzzy-song="${r.songId}" style="border-bottom:1px solid var(--line);padding:8px 0;">
-            <div style="font-weight:500;">${r.title} — ${r.artist}</div>
-            ${r.candidates.length ? r.candidates.map(c => `
-              <div class="song-row" style="margin-top:6px;">
-                <img class="art" src="${c.albumArtUrl || ''}" />
-                <div style="flex:1;min-width:0;">
-                  <div>${c.name}</div>
-                  <div class="muted">${c.albumName} &middot; ${c.score}% title match</div>
-                </div>
-                <button class="btn secondary" data-fuzzy-pick data-song-id="${r.songId}" data-candidate-key="${stashCandidate(c)}">Use this</button>
-              </div>
-            `).join('') : '<div class="muted" style="margin-top:4px;">No close match found in Seen In Concert.</div>'}
-            <button class="btn secondary" data-fuzzy-manual="${r.songId}" data-fuzzy-title="${r.title}" data-fuzzy-artist="${r.artist}" style="margin-top:6px;font-size:11px;">Search within Seen In Concert</button>
-            <div id="fuzzy-manual-${r.songId}"></div>
-          </div>
-        `).join('')}</div>`;
-      el.querySelectorAll('[data-fuzzy-pick]').forEach(btn => btn.onclick = async () => {
-        const songId = Number(btn.dataset.songId);
-        const track = candidateStore[btn.dataset.candidateKey];
-        btn.disabled = true;
-        try {
-          await api('/api/spotify/fuzzy-match-seen/apply', { method: 'POST', body: { songId, track } });
-          document.querySelector(`[data-fuzzy-song="${songId}"]`).innerHTML = `<span class="success" style="font-size:12px;">Matched to ${track.name}.</span>`;
-        } catch (err) { showModal(err.message, { title: 'Error' }); btn.disabled = false; }
-      });
-      el.querySelectorAll('[data-fuzzy-manual]').forEach(btn => btn.onclick = () => {
-        const songId = Number(btn.dataset.fuzzyManual);
-        const box = document.getElementById(`fuzzy-manual-${songId}`);
-        box.innerHTML = `
-          <div class="row" style="margin-top:6px;">
-            <input id="fz-title-${songId}" value="${btn.dataset.fuzzyTitle}" style="max-width:220px;" />
-            <input id="fz-artist-${songId}" value="${btn.dataset.fuzzyArtist}" style="max-width:180px;" />
-            <button class="btn secondary" id="fz-go-${songId}">Search Spotify</button>
-          </div>
-          <div id="fz-results-${songId}"></div>
-        `;
-        document.getElementById(`fz-go-${songId}`).onclick = async () => {
-          const resultsEl = document.getElementById(`fz-results-${songId}`);
-          resultsEl.innerHTML = '<p class="muted">Searching within Seen In Concert...</p>';
-          const query = document.getElementById(`fz-title-${songId}`).value;
-          const artist = document.getElementById(`fz-artist-${songId}`).value;
-          try {
-            const results = await api('/api/spotify/search-within-seen', { method: 'POST', body: { query, artist } });
-            if (!results.length) { resultsEl.innerHTML = '<p class="muted">No results found within Seen In Concert.</p>'; return; }
-            resultsEl.innerHTML = results.slice(0, 8).map(c => `
-              <div class="song-row" style="margin-top:6px;">
-                <img class="art" src="${c.albumArtUrl || ''}" />
-                <div style="flex:1;min-width:0;">
-                  <div>${c.name}</div>
-                  <div class="muted">${c.artist} &middot; ${c.albumName}</div>
-                </div>
-                <button class="btn secondary" data-fuzzy-manual-pick="${songId}" data-candidate-key="${stashCandidate(c)}">Use this</button>
-              </div>
-            `).join('');
-            resultsEl.querySelectorAll('[data-fuzzy-manual-pick]').forEach(pickBtn => pickBtn.onclick = async () => {
-              const track = candidateStore[pickBtn.dataset.candidateKey];
-              pickBtn.disabled = true;
-              try {
-                await api('/api/spotify/fuzzy-match-seen/apply', { method: 'POST', body: { songId, track } });
-                document.querySelector(`[data-fuzzy-song="${songId}"]`).innerHTML = `<span class="success" style="font-size:12px;">Matched to ${track.name}.</span>`;
-              } catch (err) { showModal(err.message, { title: 'Error' }); pickBtn.disabled = false; }
-            });
-          } catch (err) { resultsEl.innerHTML = `<p class="error">${err.message}</p>`; }
-        };
-      });
-    } catch (e2) { el.innerHTML = copyableBlock(e2.message, 'error'); }
-    e.target.disabled = false;
-  };
   document.getElementById('gapcheck-btn').onclick = async (e) => {
     e.target.disabled = true;
     try { await runGapCheck(); } finally { e.target.disabled = false; }
@@ -678,7 +565,7 @@ const PLAYLIST_LABELS = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Co
 async function wireAllShowsBrowser() {
   const listEl = document.getElementById('all-shows-list');
   const filterEl = document.getElementById('all-shows-filter');
-  let shows = await api('/api/shows/all');
+  let { shows, playlistReadFailures } = await api('/api/shows/all');
   let attendedSet = new Set();
   let attendedError = null;
   async function loadAttended(force) {
@@ -717,7 +604,11 @@ async function wireAllShowsBrowser() {
   function draw(filterText) {
     const q = (filterText || '').toLowerCase();
     const rows = shows.filter(s => !q || s.venue.toLowerCase().includes(q) || new Date(s.date).toLocaleDateString().includes(q));
-    listEl.innerHTML = (attendedError ? `<p class="error" style="font-size:12px;">setlist.fm check: ${attendedError}</p>` : '') + (rows.slice(0, 100).map(s => `
+    const failureLabels = { seen: 'Seen In Concert', wes: 'Wes Concerts', dad: 'Concerts with Dad' };
+    const failureWarning = (playlistReadFailures && playlistReadFailures.length)
+      ? `<p class="error" style="font-size:12px;">Couldn't read ${playlistReadFailures.map(k => failureLabels[k] || k).join(', ')} from Spotify just now — "not in playlist" badges below may be incomplete until this succeeds.</p>`
+      : '';
+    listEl.innerHTML = failureWarning + (attendedError ? `<p class="error" style="font-size:12px;">setlist.fm check: ${attendedError}</p>` : '') + (rows.slice(0, 100).map(s => `
       <div style="border-bottom:1px solid var(--line);padding:8px 0;" data-show-block="${s.id}">
         <div>${new Date(s.date).toLocaleDateString()} — ${s.venue}${s.headliner ? ` (${s.headliner})` : ''} <span class="muted">(${s.stage})</span>
           ${s.unmatchedCount ? ` <span class="pill" style="color:var(--danger);border-color:var(--danger);">${s.unmatchedCount} not matched</span>` : ''}
@@ -739,7 +630,7 @@ async function wireAllShowsBrowser() {
       if (!confirm(`Permanently delete ${label}? This removes all its songs, artists, and companion data. This can't be undone.`)) return;
       try {
         await api(`/api/shows/${btn.dataset.deleteShow}`, { method: 'DELETE' });
-        shows = await api('/api/shows/all');
+        ({ shows } = await api('/api/shows/all'));
         draw(filterEl.value);
       } catch (e) { showModal(e.message, { title: 'Error' }); }
     });
@@ -754,7 +645,7 @@ async function wireAllShowsBrowser() {
       btn.disabled = true;
       try {
         await api(`/api/show-artists/${btn.dataset.confirmMarked}/mark-attended`, { method: 'POST' });
-        shows = await api('/api/shows/all');
+        ({ shows } = await api('/api/shows/all'));
         draw(filterEl.value);
       } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
     });
@@ -763,7 +654,7 @@ async function wireAllShowsBrowser() {
       btn.disabled = true;
       try {
         await api(`/api/show-artists/${btn.dataset.undoMarked}/unmark-attended`, { method: 'POST' });
-        shows = await api('/api/shows/all');
+        ({ shows } = await api('/api/shows/all'));
         draw(filterEl.value);
       } catch (e) { showModal(e.message, { title: 'Error' }); btn.disabled = false; }
     });
@@ -799,7 +690,7 @@ async function wireAllShowsBrowser() {
             try {
               await api('/api/setlistfm/manual-match/apply', { method: 'POST', body: { showArtistId: Number(showArtistId), setlistId: pickBtn.dataset.pickInline } });
               resultsEl.innerHTML = '<p class="success">Saved — updating list...</p>';
-              shows = await api('/api/shows/all');
+              ({ shows } = await api('/api/shows/all'));
               draw(filterEl.value);
             } catch (e) { showModal(e.message, { title: 'Error' }); pickBtn.disabled = false; pickBtn.textContent = 'Use this'; }
           });
