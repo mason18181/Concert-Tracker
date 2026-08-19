@@ -265,6 +265,12 @@ async function renderSettings() {
       <div id="search-debug-result" style="margin-top:8px;"></div>
     </div>
     <div class="card">
+      <h2>Verify matched songs</h2>
+      <p class="muted">Before gap-check required review, it used to mark a song "matched" the instant a catalog search found any plausible result — with no check that it was actually in your playlist. This goes through every currently-matched song and checks the real playlist contents: if the exact track isn't there but a different edition (same title+artist) is, it corrects the stored track to that one; if neither is found anywhere applicable, it resets the song back to pending so it goes through the current, reviewed flow instead of sitting there wrongly marked matched.</p>
+      <button class="btn secondary" id="verify-matched-btn">Verify all matched songs</button>
+      <div id="verify-matched-result" style="margin-top:10px;"></div>
+    </div>
+    <div class="card">
       <h2>Session</h2>
       <button class="btn danger" id="lock-btn">Lock app</button>
       <p class="muted" style="margin-top:8px;">Requires re-entering the host password to unlock.</p>
@@ -280,10 +286,14 @@ async function renderSettings() {
       if (!d.songs.length) { el.innerHTML = '<p class="muted">No song records match that title.</p>'; return; }
       el.innerHTML = d.songs.map(s => `
         <div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">
-          <div><b>${s.title}</b> — ${s.artist} <span class="muted">(id: ${s.id}, spotify_status: ${s.spotify_status}, track_id: ${s.spotify_track_id || 'none'})</span></div>
+          <div><b>${s.title}</b> — ${s.artist} <span class="muted">(id: ${s.id}, spotify_status: ${s.spotify_status}, track_id: ${s.spotify_track_id || 'none'}${s.spotify_track_name ? `, matched to: "${s.spotify_track_name}" (${s.spotify_album_name})` : ''})</span></div>
           ${s.occurrences.length
             ? s.occurrences.map(o => `<div class="muted" style="margin-left:12px;">${new Date(o.date).toLocaleDateString()}, ${o.venue} (${o.artist}) — status: ${o.status}</div>`).join('')
             : '<div class="muted" style="margin-left:12px;">Not attached to any show right now.</div>'}
+          ${s.playlistCheck ? s.playlistCheck.map(p => p.error
+            ? `<div class="error" style="margin-left:12px;">${p.playlist}: read failed — ${p.error}</div>`
+            : `<div class="muted" style="margin-left:12px;">${p.playlist}: exact ID present = ${p.exactMatch}${p.fuzzyMatch ? `; found "${p.fuzzyMatch.name}" (${p.fuzzyMatch.album}) by title+artist${p.fuzzyMatch.id !== s.spotify_track_id ? ' — DIFFERENT track id, likely a different edition' : ''}` : '; no title+artist match found either'}</div>`
+          ).join('') : ''}
         </div>
       `).join('');
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
@@ -305,6 +315,35 @@ async function renderSettings() {
         </div>
       `;
     } catch (e) { el.innerHTML = `<p class="error">${e.message}</p>`; }
+  };
+  document.getElementById('verify-matched-btn').onclick = async (e) => {
+    e.target.disabled = true;
+    const el = document.getElementById('verify-matched-result');
+    el.innerHTML = '<p class="muted">Reading your playlists...</p>';
+    let excludeIds = [];
+    let totalCorrected = 0, totalReset = 0, totalConfirmed = 0;
+    let allCorrected = [], allReset = [];
+    let frozenTotal = null;
+    try {
+      while (true) {
+        const r = await api('/api/spotify/verify-matched', { method: 'POST', body: { excludeIds } });
+        if (frozenTotal === null) frozenTotal = r.total;
+        totalCorrected += r.corrected;
+        totalReset += r.reset;
+        totalConfirmed += r.confirmed;
+        allCorrected = allCorrected.concat(r.correctedDetail);
+        allReset = allReset.concat(r.resetDetail);
+        excludeIds = excludeIds.concat(r.attemptedIds);
+        el.innerHTML = `<p class="muted">Checked ${fmt(r.processed)} of ${fmt(frozenTotal)} matched songs...</p>`;
+        if (r.done) break;
+      }
+      el.innerHTML = `
+        <p class="success">${fmt(totalConfirmed)} confirmed correct, ${fmt(totalCorrected)} corrected to the right edition, ${fmt(totalReset)} reset to pending (weren't found in any applicable playlist — use "Run gaps check" to re-resolve these).</p>
+        ${allCorrected.length ? `<p class="muted" style="margin-top:6px;">Corrected:</p>${allCorrected.map(c => `<div class="muted" style="font-size:12px;">${c.title} — ${c.artist}</div>`).join('')}` : ''}
+        ${allReset.length ? `<p class="muted" style="margin-top:6px;">Reset to pending:</p>${allReset.map(c => `<div class="muted" style="font-size:12px;">${c.title} — ${c.artist}</div>`).join('')}` : ''}
+      `;
+    } catch (e2) { el.innerHTML = `<p class="error">${e2.message}</p>`; }
+    e.target.disabled = false;
   };
   document.getElementById('sfm-debug-btn').onclick = async () => {
     const el = document.getElementById('sfm-debug-result');
