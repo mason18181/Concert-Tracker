@@ -68,7 +68,7 @@ app.get('/api/songs/lookup', requireAuth, async (req, res) => {
   const title = req.query.title || '';
   if (!title) return res.json({ songs: [] });
   const songs = (await pool.query(
-    `SELECT id, title, artist, spotify_status, spotify_track_id FROM songs WHERE title ILIKE $1 ORDER BY id`,
+    `SELECT id, title, artist, spotify_status, spotify_track_id, spotify_track_name, spotify_album_name FROM songs WHERE title ILIKE $1 ORDER BY id`,
     [`%${title}%`]
   )).rows;
   for (const song of songs) {
@@ -77,6 +77,40 @@ app.get('/api/songs/lookup', requireAuth, async (req, res) => {
       FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
       WHERE ss.song_id = $1 ORDER BY sh.date
     `, [song.id])).rows;
+
+    // If this song has a real track_id, check each of the three playlists
+    // two ways: does the exact stored ID appear there, and separately —
+    // ignoring our stored ID entirely — does ANY track with this song's
+    // title+artist appear there. If the fuzzy check finds it somewhere the
+    // exact check doesn't, that's a version mismatch: the song genuinely
+    // is in that playlist, just as a different edition than the one we
+    // matched to.
+    if (song.spotify_track_id) {
+      const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+      const targetDefs = [
+        { key: 'seen', label: 'Seen In Concert', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+        { key: 'wes', label: 'Wes Concerts', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+        { key: 'dad', label: 'Concerts with Dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+      ].filter(t => t.playlistId);
+      song.playlistCheck = [];
+      for (const t of targetDefs) {
+        try {
+          const tracks = await spotify.getPlaylistTracksFull(t.playlistId);
+          const exactMatch = tracks.some(tr => tr.id === song.spotify_track_id);
+          const fuzzyMatch = tracks.find(tr =>
+            normalizeTitle(tr.name) === normalizeTitle(song.title) &&
+            tr.artists.some(a => artistKey(a) === artistKey(song.artist))
+          );
+          song.playlistCheck.push({
+            playlist: t.label,
+            exactMatch,
+            fuzzyMatch: fuzzyMatch ? { id: fuzzyMatch.id, name: fuzzyMatch.name, album: fuzzyMatch.albumName } : null,
+          });
+        } catch (e) {
+          song.playlistCheck.push({ playlist: t.label, error: e.message });
+        }
+      }
+    }
   }
   res.json({ songs });
 });
@@ -648,48 +682,6 @@ app.post('/api/show-artists/:id/add-song', requireAuth, async (req, res) => {
 app.post('/api/show-songs/:id/remove', requireAuth, async (req, res) => {
   await pool.query('DELETE FROM show_songs WHERE id=$1', [Number(req.params.id)]);
   res.json({ ok: true });
-});
-
-// For a song that shouldn't be in the dataset at all (not something that
-// belongs to one show, but genuinely never a real performed song — like
-// walk-off/outro music setlist.fm sometimes lists as part of a setlist).
-// Songs are shared across every show they appear at, so this finds and
-// removes every occurrence in one action instead of a show-by-show hunt.
-app.get('/api/songs/:id/occurrences', requireAuth, async (req, res) => {
-  const rows = (await pool.query(`
-    SELECT ss.id AS show_song_id, sh.date, sh.venue, sa.artist
-    FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
-    WHERE ss.song_id = $1 ORDER BY sh.date
-  `, [Number(req.params.id)])).rows;
-  res.json({ occurrences: rows });
-});
-
-// Diagnostic: finds every songs-table row matching a title (there could be
-// more than one if duplicates exist), each with its full status and every
-// show it's attached to — including that show's setlist_source, since a
-// song reappearing after being removed could mean either the removal
-// didn't persist, or something else independently recreated it.
-app.get('/api/songs/lookup', requireAuth, async (req, res) => {
-  const title = req.query.title || '';
-  if (!title) return res.json({ songs: [] });
-  const songs = (await pool.query(
-    `SELECT id, title, artist, spotify_status FROM songs WHERE title ILIKE $1 ORDER BY id`,
-    [`%${title}%`]
-  )).rows;
-  for (const song of songs) {
-    song.occurrences = (await pool.query(`
-      SELECT sh.date, sh.venue, sa.artist, sa.setlist_source
-      FROM show_songs ss JOIN show_artists sa ON sa.id = ss.show_artist_id JOIN shows sh ON sh.id = sa.show_id
-      WHERE ss.song_id = $1 ORDER BY sh.date
-    `, [song.id])).rows;
-  }
-  res.json({ songs });
-});
-
-app.post('/api/songs/:id/remove-everywhere', requireAuth, async (req, res) => {
-  const songId = Number(req.params.id);
-  const result = await pool.query('DELETE FROM show_songs WHERE song_id=$1', [songId]);
-  res.json({ ok: true, removed: result.rowCount });
 });
 
 app.post('/api/shows/:id/tag', requireAuth, async (req, res) => {
@@ -1525,6 +1517,106 @@ async function getCachedPlaylistIdSets(targetDefs) {
 // Cached (10 min) per-playlist lookup maps, built from a full track fetch —
 // expensive to build once, so batches reuse it instead of re-fetching your
 // whole playlist on every chunk.
+let fullPlaylistCache = { at: 0, tracks: null };
+async function getCachedFullPlaylistTracks(targetDefs) {
+  if (fullPlaylistCache.tracks && Date.now() - fullPlaylistCache.at < 10 * 60 * 1000) return fullPlaylistCache;
+  const tracks = {};
+  const failures = [];
+  for (const t of targetDefs) {
+    try { tracks[t.key] = await spotify.getPlaylistTracksFull(t.playlistId); }
+    catch (e) { tracks[t.key] = null; failures.push(t.key); }
+  }
+  const result = { tracks, failures };
+  if (!failures.length) fullPlaylistCache = { at: Date.now(), tracks };
+  return result;
+}
+
+// Cleans up matches made before gap-check was rewired to require review —
+// the old version auto-marked a song "matched" the instant a catalog
+// search found ANY plausible candidate, with no check that it was
+// actually in your playlist. For each matched song, checks the real
+// playlist contents two ways: does the exact stored track id appear
+// there, or does a different edition (same title+artist) appear there
+// instead. If a different edition is found, corrects the stored id to
+// the one that's actually in your playlist. If neither is found anywhere
+// applicable, resets the song back to pending so it goes through the
+// current, reviewed gap-check flow instead of sitting there wrongly
+// marked "matched."
+app.post('/api/spotify/verify-matched', requireAuth, async (req, res) => {
+  const limit = 150;
+  const excludeIds = (req.body.excludeIds || []).map(Number).filter(Number.isFinite);
+
+  const cfg = (await pool.query('SELECT * FROM config WHERE id=1')).rows[0];
+  const targetDefs = [
+    { key: 'seen', playlistId: extractPlaylistId(cfg.seen_playlist_id) },
+    { key: 'wes', playlistId: extractPlaylistId(cfg.wes_playlist_id) },
+    { key: 'dad', playlistId: extractPlaylistId(cfg.dad_playlist_id) },
+  ].filter(t => t.playlistId);
+  const { tracks: fullTracks, failures: readFailures } = await getCachedFullPlaylistTracks(targetDefs);
+  if (readFailures.length) {
+    return res.status(502).json({ error: `Couldn't read ${readFailures.join(', ')} from Spotify — can't safely verify without seeing the real playlist contents. Try again in a bit.` });
+  }
+
+  const totalRow = (await pool.query(`
+    SELECT count(*) AS c FROM songs WHERE spotify_status='matched' AND spotify_track_id IS NOT NULL
+      AND ($1::int[] = '{}' OR id != ALL($1::int[]))
+  `, [excludeIds])).rows[0];
+
+  const songs = (await pool.query(`
+    SELECT id, title, artist, spotify_track_id FROM songs
+    WHERE spotify_status='matched' AND spotify_track_id IS NOT NULL
+      AND ($1::int[] = '{}' OR id != ALL($1::int[]))
+    ORDER BY id LIMIT $2
+  `, [excludeIds, limit])).rows;
+
+  let corrected = 0, reset = 0, confirmed = 0;
+  const correctedDetail = [], resetDetail = [];
+
+  for (const song of songs) {
+    const companionRows = (await pool.query(`
+      SELECT DISTINCT c.name FROM show_songs ss
+      JOIN show_artists sa ON sa.id = ss.show_artist_id
+      JOIN show_companions sc ON sc.show_id = sa.show_id
+      JOIN companions c ON c.id = sc.companion_id
+      WHERE ss.song_id = $1
+    `, [song.id])).rows.map(r => r.name);
+    const applicable = targetDefs.filter(t => t.key === 'seen' || (t.key === 'wes' && companionRows.includes('Wes')) || (t.key === 'dad' && companionRows.includes('Jeff')));
+
+    let anyExact = false, fuzzyHit = null;
+    for (const t of applicable) {
+      const list = fullTracks[t.key] || [];
+      if (list.some(tr => tr.id === song.spotify_track_id)) { anyExact = true; break; }
+      if (!fuzzyHit) {
+        fuzzyHit = list.find(tr => normalizeTitle(tr.name) === normalizeTitle(song.title) && tr.artists.some(a => artistKey(a) === artistKey(song.artist)));
+      }
+    }
+
+    if (anyExact) {
+      confirmed++;
+    } else if (fuzzyHit) {
+      await pool.query(
+        `UPDATE songs SET spotify_track_id=$1, spotify_track_name=$2, spotify_album_name=$3, spotify_album_art_url=$4 WHERE id=$5`,
+        [fuzzyHit.id, fuzzyHit.name, fuzzyHit.albumName, fuzzyHit.albumArtUrl, song.id]
+      );
+      corrected++;
+      correctedDetail.push({ title: song.title, artist: song.artist, from: song.spotify_track_id, to: fuzzyHit.id });
+    } else {
+      await pool.query(`UPDATE songs SET spotify_status='pending', spotify_track_id=NULL, spotify_track_name=NULL, spotify_album_name=NULL, spotify_album_art_url=NULL WHERE id=$1`, [song.id]);
+      await pool.query(`UPDATE show_songs SET already_on_spotify=false, added_to_seen=false, added_to_wes=false, added_to_dad=false WHERE song_id=$1`, [song.id]);
+      reset++;
+      resetDetail.push({ title: song.title, artist: song.artist });
+    }
+  }
+
+  const attemptedIds = songs.map(s => s.id);
+  const processed = excludeIds.length + attemptedIds.length;
+  res.json({
+    ok: true, corrected, reset, confirmed, correctedDetail, resetDetail,
+    attemptedIds, processed, total: Number(totalRow.c) + excludeIds.length,
+    done: songs.length < limit,
+  });
+});
+
 app.get('/api/spotify/gap-check', requireAuth, async (req, res) => {
   const limit = 40; // keeps each call well under a minute even including Spotify round-trips
   const excludeIds = (req.query.excludeIds ? req.query.excludeIds.split(',') : []).map(Number).filter(Number.isFinite);
